@@ -1,17 +1,24 @@
 #!/usr/bin/env python
 
-"""
-Bugzilla test harness.
+"""Bugzilla test harness.
 
 Manages setting up a skeleton Bugzilla installation from a template, creating a
 database for that installation, installing various modules for it from Git,
 then running a set of Selenium/WebDriver tests against the instance, before
 tearing it all down again.
+
+Usage: bugzilla_harness.py <mode> [args]
+
+Where <mode> is "run":
+
+    Execute one or more test suites.
+
 """
 
 import ConfigParser
 import contextlib
 import hashlib
+import inspect
 import json
 import logging
 import optparse
@@ -29,36 +36,7 @@ import urlparse
 
 from selenium import webdriver
 from selenium.webdriver.firefox import firefox_binary
-
-
-#
-# Global data.
-#
-
-# Result of parse_args(); global for ease of access (can tidy up later).
-CONFIG = None
-
-BASE = 'http://sanna.ntc.nokia.com:8011/'
-
-
-def write_file(path, s):
-    """Write the string `s` to `path`.
-    """
-    with open(path, 'wb') as fp:
-        fp.write(s)
-
-
-def write_json(path, obj):
-    """Write `obj` serialized as JSON to `path`.
-    """
-    write_file(path, json.dump(fp, obj))
-
-
-def read_json(path):
-    """Read an object serialized as JSON from `path`.
-    """
-    with open(path, 'rb') as fp:
-        return json.load(fp)
+from selenium.webdriver.remote.command import Command
 
 
 def find_free_port(host=None, desired=0):
@@ -74,17 +52,6 @@ def find_free_port(host=None, desired=0):
     addr = s.getsockname()
     s.close()
     return addr
-
-
-def try_until(fn, tries=5, delay=1, initial=0.125, expect=True):
-    """Repeatedly call a function until it returns some desired value. Return
-    True on success.
-    """
-    time.sleep(initial)
-    for _ in xrange(tries):
-        if fn() == expect:
-            return True
-        time.sleep(delay)
 
 
 def get_public_ip():
@@ -105,15 +72,20 @@ def wait_port_listen(host, port, tries=5, delay=1, initial=0.125, expect=True):
     Returns True on success.
     """
     log = logging.getLogger('wait_port_listen')
-    def once():
+    time.sleep(initial)
+
+    for _ in xrange(tries):
         with contextlib.closing(socket.socket()) as sock:
             try:
                 sock.connect((host, port))
-                return True
+                if expect:
+                    return True
             except socket.error, e:
                 log.warn('connect(%r, %d): %s', host, port, e)
+                if not expect:
+                    return False
 
-    return try_until(once, tries, delay, initial)
+        time.sleep(delay)
 
 
 def search_path(filename):
@@ -204,63 +176,21 @@ def edit_file(path, pattern, new_line, insert_at=0):
         fp.write(''.join(lines))
 
 
-def parse_config(path):
-    """Parse an INI file into a dictionary like:
-    
-        {'section.option': 'value',
-         'section.option2': 'value2'}
-
-    This eases writing tests simply by passing regular dicts as configuration,
-    instead of manually populating a ConfigParser. Returned dict contains a
-    magical 'section_items' key which contains all items for a given section,
-    to allow enumeration.
-    """
-    parser = ConfigParser.RawConfigParser()
-    with open(path) as fp:
-        parser.readfp(fp)
-
-    items = {}
-    dct = {'section_items': items}
-
-    for section in parser.sections():
-        items[section] = parser.items(section)
-        dct.update(('%s.%s' % (section, option), value)
-                   for (option, value) in items[section]
-                   if value)
-
-    return dct
-
-
-def parse_args(args):
-    """Parse command-line arguments, returning a dict whose keys should match
-    those found in the configuration file.
-    """
-    parser = optparse.OptionParser()
-    add = parser.add_option
-
-    add('-c', '--config', help='Pass an additional config file. Options '
-        'specified in this file will override the defaults', metavar='file',
-        action="append", default=["bugzilla_harness.conf"])
-    add('-o', '--offline', help='Work offline (i.e. don\'t try to refresh '
-        'git repositories)', metavar='offline', action='store_true')
-    add('-v', '--verbose', help='Increase log verbosity (debug mode)',
-        action="store_true", default=False)
-
-    options, _ = parser.parse_args(args)
-
-    config = {}
-    for path in options.config:
-        config.update(parse_config(path))
-
-    config['verbose'] = options.verbose
-    return config
-
-
 def make_id(prefix):
     """Return a 'unique' ID with the given prefix, based on the current system
     time.
     """
     return '%s_%s' % (prefix, int(time.time() * 1000))
+
+
+def get_extensions(config):
+    exts = []
+    for section, items in config['section_items'].iteritems():
+        if section.startswith('extension: '):
+            name = section[11:]
+            dct = dict(items)
+            exts.append((name, dct['url'], dct['branch']))
+    return exts
 
 
 class Repository:
@@ -364,7 +294,7 @@ class CgiServer:
 
         host = get_public_ip() if public else None
         self.host, self.port = find_free_port(host)
-        self.url = 'http://%s:%d/' % (self.host, self.port)
+        self.root_url = 'http://%s:%d/' % (self.host, self.port)
         self.conf_path = os.path.join(self.state_dir, 'lighttpd.conf')
 
     def start(self):
@@ -377,10 +307,10 @@ class CgiServer:
         self.proc = subprocess.Popen(args)
 
         if not wait_port_listen(self.host, self.port):
-            raise Exception('httpd not listening on %s' % self.url)
+            raise Exception('httpd not listening on %s' % self.root_url)
 
         self.log.info('httpd listening on %s using PID %d',
-            self.url, self.proc.pid)
+            self.root_url, self.proc.pid)
 
     def stop(self):
         """Stop the server.
@@ -388,8 +318,8 @@ class CgiServer:
         self.log.debug('Killing httpd PID %d', self.proc.pid)
         self.proc.terminate()
 
-    def make_url(self, suffix, **kwargs):
-        url = urlparse.urljoin(self.url, suffix)
+    def url(self, suffix, **kwargs):
+        url = urlparse.urljoin(self.root_url, suffix)
         if kwargs:
             url += '?' + urllib.urlencode(kwargs)
         return url
@@ -398,31 +328,21 @@ class CgiServer:
 class BugzillaInstance:
     """Manage everything to do with creating a Bugzilla installation.
     """
-    def __init__(self, config, repo, base_dir=None):
-        """Create an instance. If `base_dir` is None, creates a temporary
-        instance that will be completely destroyed by destroy(). Otherwise,
-        opens the existing persistent instance stored in `base_dir`.
+    def __init__(self, config, repo):
+        """Create an instance.
         """
         self.config = config
         self.repo = repo
-
-        if base_dir:
-            self.base_dir = base_dir
-            self.temp = False
-            state = read_json(os.path.join(base_dir, 'state.json'))
-            self.instance_id = state['instance_id']
-        else:
-            self.instance_id = make_id('BugzillaHarness')
-            self.base_dir = os.path.join(tempfile.gettempdir(),
-                self.instance_id)
-            self.temp = True
+        self.instance_id = make_id('BugzillaHarness')
+        self.base_dir = os.path.join(tempfile.gettempdir(),
+            self.instance_id)
 
         if not os.path.exists(self.base_dir):
             os.mkdir(self.base_dir, 0755)
 
         self.log = logging.getLogger('BugzillaInstance')
-        self.log.debug('Base directory: %r; ID %s; is temporary? %s',
-            self.base_dir, self.instance_id, self.temp)
+        self.log.debug('Base directory: %r; ID %s',
+            self.base_dir, self.instance_id)
 
         self.perl_path = search_path('perl')
         self.bz_dir = os.path.join(self.base_dir, 'bugzilla')
@@ -432,9 +352,6 @@ class BugzillaInstance:
     def destroy(self):
         """If this is a temporary instance, destroy all its resources.
         """
-        if not self.temp:
-            return
-
         self.log.info('Destroying %r', self.base_dir)
         shutil.rmtree(self.base_dir, ignore_errors=True)
         self._mysql('mysqladmin', '--force', 'drop', self.instance_id)
@@ -489,7 +406,7 @@ class BugzillaInstance:
 
         dest_dir = os.path.join(self.bz_dir, 'lib')
         self.log.debug('Extracting %r to %r', path, dest_dir)
-        run([search_path('unzip'), path, '-d', dest_dir])
+        run(['unzip', path, '-d', dest_dir])
 
     def _install_modules(self):
         '''/usr/bin/perl install-module.pl --all'''
@@ -521,7 +438,9 @@ class BugzillaInstance:
         edit_file(self.bz_localconfig, pattern, new_line)
 
     def _setup_localconfig(self):
-        self.set_config('db_pass', 'bugs')
+        self.set_config('db_name', self.instance_id)
+        self.set_config('db_user', self.config['mysql.username'])
+        self.set_config('db_pass', self.config['mysql.password'])
         self.set_config('webservergroup', '')
         stdout, stderr = self._run_checksetup()
 
@@ -541,55 +460,117 @@ class BugzillaInstance:
         edit_file(path, pattern, new_line, 1)
 
 
-
-def url(s, *args):
-    if args:
-        s %= args
-    return BASE + s
-
-
-def login():
-    pass
-
-
-def get_extensions(config):
-    exts = []
-    for section, items in config['section_items'].iteritems():
-        if section.startswith('extension: '):
-            name = section[11:]
-            dct = dict(items)
-            exts.append((name, dct['url'], dct['branch']))
-    return exts
-
-
-def main():
-    """Main program implementation.
+class Suite:
+    """A test suite.
     """
-    config = parse_args(sys.argv[1:])
+    def __init__(self, config, server, bz):
+        self.log = logging.getLogger(self.__class__.__name__)
+        self.config = config
+        self.server = server
+        self.bz = bz
+        self.failures = []
 
-    level = logging.DEBUG if config['verbose'] else logging.INFO
-    logging.basicConfig(level=level)
+    def assertRequiresLogin(self, suffix, **kwargs):
+        url = self.server.url(suffix, **kwargs)
+        self.driver.get(url)
+        text = self.driver.execute(Command.GET_ELEMENT_TEXT, 'error_msg')
+        from pprint import pprint
+        pprint(text)
+        assert text == 'You must log in before using this part of Bugzilla.'
+        exit()
 
-    repo = Repository(cache_dir='repo_cache')
+    def _get_methods(self):
+        return [obj for name, obj in inspect.getmembers(self)
+                if name.startswith('test') and inspect.ismethod(obj)]
 
-    bz = BugzillaInstance(config, repo)
-    bz.create()
-    bz.set_param('upgrade_notification', 'disabled')
-    bz.set_param('urlbase', server.url)
+    def _run_one(self, method):
+        try:
+            method()
+        except Exception, e:
+            self.log.exception('Method %s failed.', method.func_name)
+            self.failures.append((method.func_name, e))
 
-    server = CgiServer(bz.base_dir, bz.bz_dir,
-        public=int(config['lighttpd.public']))
-    server.start()
+    def run(self):
+        for method in self._get_methods():
+            self._run_one(method)
 
-    try:
-        run_tests()
-    finally:
-        server.stop()
-        bz.destroy()
 
-    return
-    global driver
+def parse_config(path):
+    """Parse an INI file into a dictionary like:
+    
+        {'section.option': 'value',
+         'section.option2': 'value2'}
 
+    This eases writing tests simply by passing regular dicts as configuration,
+    instead of manually populating a ConfigParser. Returned dict contains a
+    magical 'section_items' key which contains all items for a given section,
+    to allow enumeration.
+    """
+    parser = ConfigParser.RawConfigParser()
+    with open(path) as fp:
+        parser.readfp(fp)
+
+    items = {}
+    dct = {'section_items': items}
+
+    for section in parser.sections():
+        items[section] = parser.items(section)
+        dct.update(('%s.%s' % (section, option), value)
+                   for (option, value) in items[section]
+                   if value)
+
+    return dct
+
+
+def usage(fmt, *args):
+    sys.stderr.write(__doc__)
+    if args:
+        fmt %= args
+    if fmt:
+        sys.stderr.write('%s: ERROR: %s\n' % (sys.argv[0], fmt))
+    raise SystemExit(1)
+
+
+def parse_args(args):
+    """Parse command-line arguments, returning a dict whose keys should match
+    those found in the configuration file.
+    """
+    parser = optparse.OptionParser()
+    add = parser.add_option
+
+    add('-c', '--config', help='Pass an additional config file. Options '
+        'specified in this file will override the defaults', metavar='file',
+        action="append", default=["bugzilla_harness.conf"])
+    add('-o', '--offline', help='Work offline (i.e. don\'t try to refresh '
+        'git repositories)', metavar='offline', action='store_true')
+    add('-v', '--verbose', help='Increase log verbosity (debug mode)',
+        action="store_true", default=False)
+
+    options, args = parser.parse_args(args)
+
+    config = {}
+    for path in options.config:
+        config.update(parse_config(path))
+
+    config['verbose'] = options.verbose
+    config['offline'] = options.offline
+
+    if not args:
+        usage('Please specify a mode.')
+
+    mode = args.pop(0)
+    if mode == 'run':
+        if not len(args):
+            usage('Must specify at least one test suite filename with "run".')
+    else:
+        usage('Mode %r is invalid.', mode)
+
+    config['mode'] = mode
+    config['args'] = args
+    return config
+
+
+def run_tests(config):
     x11 = X11Server()
     x11.start()
 
@@ -600,13 +581,35 @@ def main():
     binary = firefox_binary.FirefoxBinary('/usr/local/firefox/firefox-bin')
     driver = webdriver.Firefox(firefox_binary=binary)
 
-    DB = url('page.cgi?id=dashboard.html')
-    print driver.get(DB)
-    el = driver.find_element_by_class_name('throw_error')
-    help(type(el))
-    assert el.text == 'You must log in before using this part of Bugzilla.'
-
     binary.kill()
+
+
+def main():
+    """Main program implementation.
+    """
+    config = parse_args(sys.argv[1:])
+
+    level = logging.DEBUG if config['verbose'] else logging.INFO
+    logging.basicConfig(level=level)
+
+    repo = Repository(cache_dir='repo_cache',
+        refresh_cache=not config['offline'])
+
+    bz = BugzillaInstance(config, repo)
+    bz.create()
+
+    server = CgiServer(bz.base_dir, bz.bz_dir,
+        public=int(config['lighttpd.public']))
+    server.start()
+
+    bz.set_param('upgrade_notification', 'disabled')
+    bz.set_param('urlbase', server.root_url)
+
+    try:
+        run_tests(config, server, bz)
+    finally:
+        server.stop()
+        bz.destroy()
 
 if __name__ == '__main__':
     main()

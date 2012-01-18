@@ -1,0 +1,20 @@
+
+
+NOTES
+
+    In order to test Bugzilla, a web server must be setup. bugzilla_harness
+    uses lighttpd for this purpose, as it is possible to run it without root
+    privileges. Unfortunately Apache *insists* on setuid() calls, even when
+    configured to run under the current UID.
+
+
+
+REQUIREMENTS
+
+    apt-get install lighttpd ; rm /etc/rc2.d/*light* # lighttpd
+    apt-get install xvfb # Xvfb
+    apt-get install mysql-server # Needs a MySQLd somewhere
+    apt-get install mysql-client # mysqladmin, mysql
+    apt-get install unzip
+    easy_install selenium # selenium.webdriver Python package.
+
