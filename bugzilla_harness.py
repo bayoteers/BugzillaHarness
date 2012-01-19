@@ -1,17 +1,62 @@
 #!/usr/bin/env python
 
-"""Bugzilla test harness.
+"""Manage setting up a Bugzilla installation from a template, creating a
+database for that installation, installing extensions from Git, and running a
+set of Selenium/WebDriver tests, before tearing it all down again.
 
-Manages setting up a skeleton Bugzilla installation from a template, creating a
-database for that installation, installing various modules for it from Git,
-then running a set of Selenium/WebDriver tests against the instance, before
-tearing it all down again.
+Usage: bugzilla_harness.py <mode> [options] [args]
 
-Usage: bugzilla_harness.py <mode> [args]
+Options accepted by all modes:
+    -v
+        Enable debug output.
 
-Where <mode> is "run":
+    --config=<path>
+        Add the specified configuration file to the list of configuration files
+        to be parsed. If no --config is specified, looks for
+        "bugzilla_harness.conf" in the current directory. Subsequently
+        specified configuration files override the values specified in earlier
+        files.
 
-    Execute one or more test suites.
+    --extension=<name>:<revspec>
+        When checking out an extension, use the specified revision rather than
+        the tip of the default branch. This can be used from a post-commit
+        script to force testing of the committed revision, rather than the
+        whatever happens to be the new tip by the time the harness runs (i.e.
+        to avoid a race condition).
+
+    --extensions=[<name>[,...]]
+        When creating a Bugzilla instance, install only the named extensions.
+        If unspecified, defaults to installing all extensions listed in the
+        harness configuration.
+
+create <base_dir> [--extensions=...]
+    Create a Bugzilla installation in the given path, and populate a MySQL
+    database for it. If --extensions= is given, use only the specified list of
+    extensions (may be empty), otherwise use the default extension list from
+    the harness configuration path.
+
+start <base_dir>
+    Start an HTTP server for the given Bugzilla instance.
+
+stop <base_dir>
+    Stop the HTTP server running for the given Bugzilla instance.
+
+destroy <base_dir>
+    Destroy a Bugzilla installation in the given path, along with its
+    associated MySQL database.
+
+run [--instance=<path>] <suite_path> [...]
+    Run a set of test suites against a Bugzilla instance, creating a temporary
+    instance as desired. At least one test suite must be specified.
+
+    --instance=<path>
+        Rather than create a temporary Bugzilla instance, use the instance at
+        <path> that was previously created using the "create" subcommand.
+        Useful for speeding up repeated runs when debugging a failed test.
+
+    <suite_path>
+        Path to a Python script implementing the a suite, e.g.
+        dashboard_tests.py.
 
 """
 
@@ -25,6 +70,7 @@ import optparse
 import os
 import re
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -47,7 +93,8 @@ def find_free_port(host=None, desired=0):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         s.bind((host, desired))
-    except socket.error:
+    except socket.error, e:
+        logging.warning('find_free_port: %s', e)
         return
     addr = s.getsockname()
     s.close()
@@ -89,11 +136,11 @@ def wait_port_listen(host, port, tries=5, delay=1, initial=0.125, expect=True):
 
 
 def search_path(filename):
-    search_list = os.environ.get('PATH')
-    if not search_list:
+    s = os.environ.get('PATH')
+    if not s:
         return
 
-    for dirname in search_list.split(os.path.pathsep):
+    for dirname in s.split(os.path.pathsep):
         path = os.path.join(dirname, filename)
         if os.path.exists(path):
             return path
@@ -193,6 +240,18 @@ def get_extensions(config):
     return exts
 
 
+def mysql(config, prog, *args):
+    """Run a MySQL utility program `prog` with authorization parameters
+    added to the command line. Returns (stdout, stderr) tuple.
+    """
+    args = [prog,
+            '-u' + config['mysql.username'],
+            '-p' + config['mysql.password'],
+            '-h' + config['mysql.hostname']] + list(args)
+    logging.debug('Running %r', args)
+    return run(args)
+
+
 class Repository:
     """Manages a cache of remote repositories, primarily to speed up creation
     of local Bugzilla instances.
@@ -288,7 +347,7 @@ class CgiServer:
         `doc_root` via HTTP.
         """
         self.state_dir = state_dir
-        self.doc_root = doc_root
+        self.doc_root = os.path.abspath(doc_root)
         self.public = public
         self.log = logging.getLogger('CgiServer')
 
@@ -304,19 +363,27 @@ class CgiServer:
             fp.write(self.CONF_TEMPLATE % vars(self))
 
         args = ['lighttpd', '-f', self.conf_path, '-D']
-        self.proc = subprocess.Popen(args)
+        proc = subprocess.Popen(args)
 
         if not wait_port_listen(self.host, self.port):
             raise Exception('httpd not listening on %s' % self.root_url)
 
         self.log.info('httpd listening on %s using PID %d',
-            self.root_url, self.proc.pid)
+            self.root_url, proc.pid)
 
     def stop(self):
         """Stop the server.
         """
-        self.log.debug('Killing httpd PID %d', self.proc.pid)
-        self.proc.terminate()
+        path = os.path.join(self.state_dir, 'lighttpd.pid')
+        if not os.path.exists(path):
+            self.log.warning("No PID file, can't stop.")
+            return
+
+        with file(path) as fp:
+            pid = int(fp.read().strip())
+
+        self.log.debug('Killing httpd PID %d', pid)
+        os.kill(pid, signal.SIGTERM)
 
     def url(self, suffix, **kwargs):
         url = urlparse.urljoin(self.root_url, suffix)
@@ -325,78 +392,83 @@ class CgiServer:
         return url
 
 
-class BugzillaInstance:
+class InstanceBuilder:
     """Manage everything to do with creating a Bugzilla installation.
     """
-    def __init__(self, config, repo):
-        """Create an instance.
-        """
+    def __init__(self, config, instance_id=None, base_dir=None):
         self.config = config
-        self.repo = repo
-        self.instance_id = make_id('BugzillaHarness')
-        self.base_dir = os.path.join(tempfile.gettempdir(),
-            self.instance_id)
+        self.instance_id = instance_id or make_id('BugzillaInstance')
+        self.base_dir = base_dir or os.path.join(
+            tempfile.gettempdir(), self.instance_id)
+
+        self.repo = Repository(cache_dir='repo_cache',
+            refresh_cache=not config['offline'])
+        self.bz_dir = os.path.join(self.base_dir, 'bugzilla')
+
+        self.perl_path = search_path('perl')
+        self.arch = get_elf_arch(self.perl_path)
+
+        self.log = logging.getLogger('InstanceBuilder')
+        self.log.debug('Base directory: %r; ID: %r',
+            self.base_dir, self.instance_id)
 
         if not os.path.exists(self.base_dir):
             os.mkdir(self.base_dir, 0755)
 
-        self.log = logging.getLogger('BugzillaInstance')
-        self.log.debug('Base directory: %r; ID %s',
-            self.base_dir, self.instance_id)
-
-        self.perl_path = search_path('perl')
-        self.bz_dir = os.path.join(self.base_dir, 'bugzilla')
-        self.ext_dir = os.path.join(self.bz_dir, 'extensions')
-        self.bz_localconfig = os.path.join(self.bz_dir, 'localconfig')
-
-    def destroy(self):
-        """If this is a temporary instance, destroy all its resources.
-        """
-        self.log.info('Destroying %r', self.base_dir)
-        shutil.rmtree(self.base_dir, ignore_errors=True)
-        self._mysql('mysqladmin', '--force', 'drop', self.instance_id)
-
-    def create(self):
+    def build(self):
         self.repo.clone(self.config['bugzilla.url'],
             self.config['bugzilla.branch'], self.bz_dir)
-        self.version = get_bugzilla_version(self.bz_dir)
-        self.arch = get_elf_arch(self.perl_path)
+        self._write_state()
+
+        self.instance = BugzillaInstance(self.config, self.base_dir)
+
         self._create_db()
         self._create_extensions()
         self._create_bz_lib()
         self._install_modules()
         self._run_checksetup()
         self._setup_localconfig()
+
+        self.instance.set_param('upgrade_notification', 'disabled')
         self.log.debug('Bugzilla completely configured.')
+
+        return self.instance
+
+    def _write_state(self):
+        path = os.path.join(self.base_dir, 'state.json')
+        with file(path, 'wb') as fp:
+            json.dump({
+                'instance_id': self.instance_id
+            }, fp)
 
     def _create_extensions(self):
         for name, repo, branch in get_extensions(self.config):
-            path = os.path.join(self.ext_dir, name)
+            path = os.path.join(self.instance.ext_dir, name)
             self.repo.clone(repo, branch, path)
 
     def _get_snapshot_path(self):
-        path = os.path.join('db_snapshots', 'snapshot_%s.sql' % (self.version,))
+        """Return the path of the MySQL database snapshot matching this
+        instance's Bugzilla version, or throw an exception if none exists.
+        """
+        path = os.path.join('db_snapshots', 'snapshot_%s.sql' %\
+            (self.instance.version,))
         if os.path.exists(path):
             return path
         self.log.error('Snapshot for version %r not found at %r',
-            self.version, path)
+            self.instance.version, path)
         raise Exception('Missing database snapshot (see log).')
 
-    def _mysql(self, prog, *args):
-        args = [prog,
-                '-u' + self.config['mysql.username'],
-                '-p' + self.config['mysql.password'],
-                '-h' + self.config['mysql.hostname']] + list(args)
-        self.log.debug('Running %r', args)
-        return run(args)
-
     def _create_db(self):
-        self._mysql('mysqladmin', 'create', self.instance_id)
-        self._mysql('mysql', self.instance_id,
+        """Create a MySQL database named after this Bugzilla instance, and
+        restore an initial snapshot from the snapshots directory. Fails if no
+        suitable snapshot is found.
+        """
+        mysql(self.config, 'mysqladmin', 'create', self.instance_id)
+        mysql(self.config, 'mysql', self.instance_id,
             '-e', '\\. ' + self._get_snapshot_path())
 
     def _create_bz_lib(self):
-        filename = 'lib_cache_%s_%s.zip' % (self.version, self.arch)
+        filename = 'lib_cache_%s_%s.zip' % (self.instance.version, self.arch)
         path = os.path.join(self.config['bugzilla.lib_cache_dir'], filename)
 
         if not os.path.exists(path):
@@ -409,7 +481,9 @@ class BugzillaInstance:
         run(['unzip', path, '-d', dest_dir])
 
     def _install_modules(self):
-        '''/usr/bin/perl install-module.pl --all'''
+        """Install any modules missing from the lib directory necessary for
+        Bugzilla (and any installed extensions) to function.
+        """
         stdout, stderr = run([self.perl_path, 'install-module.pl', '--all'],
             cwd=self.bz_dir)
 
@@ -421,27 +495,25 @@ class BugzillaInstance:
                 raise Exception('install-module.pl failed.')
 
     def _run_checksetup(self):
+        """Run checksetup.pl, testing to see if the 'localconfig' settings file
+        was created successfully at the end of the run.
+        """
         stdout, stderr = run([self.perl_path, 'checksetup.pl', '-t'],
             cwd=self.bz_dir)
-        if not os.path.exists(self.bz_localconfig):
-            self.log.error('create_localconfig: %r was not created; '
+        if not os.path.exists(self.instance.bz_localconfig):
+            self.log.error('_run_checksetup: %r was not created; '
                 'stdout: %s\n\nstderr: %s', path, stdout, stderr)
             raise Exception('checksetup.pl failed.')
         return stdout, stderr
 
-    def set_config(self, key, value):
-        """Add or update the value of a configuration variable in
-        <bz_dir/localconfig>.
-        """
-        pattern = r'^\$' + re.escape(key)
-        new_line = '$%s = %r;' % (key, value)
-        edit_file(self.bz_localconfig, pattern, new_line)
-
     def _setup_localconfig(self):
-        self.set_config('db_name', self.instance_id)
-        self.set_config('db_user', self.config['mysql.username'])
-        self.set_config('db_pass', self.config['mysql.password'])
-        self.set_config('webservergroup', '')
+        """Update localconfig's DB connection parameters to match the MySQL
+        connection specified in the harness configuration.
+        """
+        self.instance.set_config('db_name', self.instance_id)
+        self.instance.set_config('db_user', self.config['mysql.username'])
+        self.instance.set_config('db_pass', self.config['mysql.password'])
+        self.instance.set_config('webservergroup', '')
         stdout, stderr = self._run_checksetup()
 
         must_have = 'Now that you have installed Bugzilla'
@@ -450,6 +522,47 @@ class BugzillaInstance:
                 'checksetup.pl output.\nstdout: %s\n\nstderr: %s',
                 must_have, stdout, stderr)
             raise Exception('setup_localconfig() failed.')
+
+
+class BugzillaInstance:
+    def __init__(self, config, base_dir):
+        """Create an instance.
+        """
+        self.config = config
+        self.base_dir = base_dir
+
+        self._read_state()
+
+        self.log = logging.getLogger('BugzillaInstance')
+        self.log.debug('Base directory: %r; ID: %r',
+            self.base_dir, self.instance_id)
+
+        self.bz_dir = os.path.join(self.base_dir, 'bugzilla')
+        self.ext_dir = os.path.join(self.bz_dir, 'extensions')
+        self.bz_localconfig = os.path.join(self.bz_dir, 'localconfig')
+
+        self.version = get_bugzilla_version(self.bz_dir)
+
+    def _read_state(self):
+        path = os.path.join(self.base_dir, 'state.json')
+        with file(path, 'rb') as fp:
+            state = json.load(fp)
+        self.instance_id = state['instance_id']
+
+    def destroy(self):
+        """If this is a temporary instance, destroy all its resources.
+        """
+        self.log.info('Destroying %r', self.base_dir)
+        shutil.rmtree(self.base_dir, ignore_errors=True)
+        mysql(self.config, 'mysqladmin', '--force', 'drop', self.instance_id)
+
+    def set_config(self, key, value):
+        """Add or update the value of a configuration variable in
+        <bz_dir/localconfig>.
+        """
+        pattern = r'^\$' + re.escape(key)
+        new_line = '$%s = %r;' % (key, value)
+        edit_file(self.bz_localconfig, pattern, new_line)
 
     def set_param(self, key, value):
         """Insert (or update) a data/params key.
@@ -527,7 +640,7 @@ def usage(fmt, *args):
     if args:
         fmt %= args
     if fmt:
-        sys.stderr.write('%s: ERROR: %s\n' % (sys.argv[0], fmt))
+        sys.stderr.write('ERROR: %s\n' % (fmt,))
     raise SystemExit(1)
 
 
@@ -555,61 +668,119 @@ def parse_args(args):
     config['verbose'] = options.verbose
     config['offline'] = options.offline
 
-    if not args:
-        usage('Please specify a mode.')
+    return config, args
 
-    mode = args.pop(0)
-    if mode == 'run':
-        if not len(args):
-            usage('Must specify at least one test suite filename with "run".')
+
+def create_instance(config, args):
+    """'create' mode implementation: create a persistent Bugzilla install at
+    the given path.
+    """
+    try:
+        base_dir, = args
+    except ValueError:
+        usage('Create expects exactly one parameter.')
+
+    builder = InstanceBuilder(config, base_dir=base_dir)
+    builder.build()
+
+
+def start_instance(config, args):
+    try:
+        base_dir, = args
+    except ValueError:
+        usage('Must specify exactly one instance path.')
+
+    instance = BugzillaInstance(config, base_dir=base_dir)
+    server = CgiServer(instance.base_dir, instance.bz_dir,
+        public=int(config['lighttpd.public']))
+    server.start()
+
+
+def stop_instance(config, args):
+    try:
+        base_dir, = args
+    except ValueError:
+        usage('Must specify exactly one instance path.')
+
+    instance = BugzillaInstance(config, base_dir=base_dir)
+    server = CgiServer(instance.base_dir, instance.bz_dir,
+        public=int(config['lighttpd.public']))
+    server.stop()
+
+
+def destroy_instance(config, args):
+    try:
+        base_dir, = args
+    except ValueError:
+        usage('Must specify exactly one instance path.')
+
+    instance = BugzillaInstance(config, base_dir=base_dir)
+    instance.destroy()
+
+
+def run_suite(config, args):
+    if not len(args):
+        usage('Must specify at least one test suite path.')
+
+    if config.get('instance'):
+        instance = BugzillaInstance(config,
+            base_dir=config['instance'])
     else:
-        usage('Mode %r is invalid.', mode)
+        builder = InstanceBuilder(config)
+        instance = builder.build()
 
-    config['mode'] = mode
-    config['args'] = args
-    return config
+    server = CgiServer(instance.base_dir, instance.bz_dir,
+        public=int(config['lighttpd.public']))
+    server.start()
+    instance.set_param('urlbase', server.root_url)
 
+    try:
+        x11 = X11Server()
+        x11.start()
 
-def run_tests(config):
-    x11 = X11Server()
-    x11.start()
+        os.environ['DISPLAY'] = x11.display_name
+        os.environ.pop('http_proxy', None)
+        os.environ.pop('https_proxy', None)
 
-    os.environ['DISPLAY'] = x11.display_name
-    os.environ.pop('http_proxy', None)
-    os.environ.pop('https_proxy', None)
+        binary = firefox_binary.FirefoxBinary('/usr/local/firefox/firefox-bin')
+        driver = webdriver.Firefox(firefox_binary=binary)
 
-    binary = firefox_binary.FirefoxBinary('/usr/local/firefox/firefox-bin')
-    driver = webdriver.Firefox(firefox_binary=binary)
+        binary.kill()
 
-    binary.kill()
+        run_tests(config, server, bz)
+    finally:
+        server.stop()
+
+        # If no --instance= given on command line, then the instance we have
+        # must be temporary, so destroy it.
+        if not config.get('instance'):
+            instance.destroy()
 
 
 def main():
     """Main program implementation.
     """
-    config = parse_args(sys.argv[1:])
-
+    config, args = parse_args(sys.argv[1:])
     level = logging.DEBUG if config['verbose'] else logging.INFO
     logging.basicConfig(level=level)
 
-    repo = Repository(cache_dir='repo_cache',
-        refresh_cache=not config['offline'])
+    if not args:
+        usage('Please specify a mode.')
 
-    bz = BugzillaInstance(config, repo)
-    bz.create()
+    MODES = {
+        'create': create_instance,
+        'start': start_instance,
+        'stop': stop_instance,
+        'run': run_suite,
+        'destroy': destroy_instance
+    }
 
-    server = CgiServer(bz.base_dir, bz.bz_dir,
-        public=int(config['lighttpd.public']))
-    server.start()
+    mode = args.pop(0)
+    handler = MODES.get(mode)
+    if not handler:
+        usage('Invalid mode.')
 
-    bz.set_param('upgrade_notification', 'disabled')
-    bz.set_param('urlbase', server.root_url)
-
-    try:
-        run_tests(config, server, bz)
-    finally:
-        server.stop()
-        bz.destroy()
+    handler(config, args)
 
 if __name__ == '__main__':
     main()
