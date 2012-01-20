@@ -161,6 +161,9 @@ def wait_port_listen(host, port, tries=5, delay=1, initial=0.125, expect=True):
 
 
 def search_path(filename):
+    """Search the system PATH for a file named `filename`, returning the full
+    path on success, or None if not found.
+    """
     s = os.environ.get('PATH')
     if not s:
         return
@@ -348,10 +351,14 @@ class Repository:
         elif self.refresh_cache:
             self.fetch(repo, cache_dir)
 
+        # We use a file:// URL here to avoid a git-fetch warning when using
+        # --depth.
+        url = 'file://%s' % os.path.abspath(cache_dir)
+
         self.log.debug('Shallow cloning %r branch %r into %r',
             repo, branch, dest_dir)
         run(['git', 'clone', '-q', '-b', branch, '--depth', '1',
-            cache_dir, dest_dir])
+            url, dest_dir])
 
 
 class X11Server:
