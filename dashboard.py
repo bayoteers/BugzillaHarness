@@ -1,26 +1,33 @@
 #!/usr/bin/env python
 
+"""Simple test suite for Dashboard.
 """
-Simple test suite for Dashboard.
-"""
 
-from bugzilla_harness import Suite
+import bugzilla_harness
 
-from selenium.webdriver.remote.command import Command
-
+URL = 'page.cgi?id=dashboard.html'
+FAULT_REQUIRES_LOGIN = 410
 
 
-class DashboardSuite(Suite):
-    REQUIRE_EXTENSIONS = ['Dashboard']
-
+class DashboardSuite(bugzilla_harness.Suite):
     def testRequiresLogin(self):
-        self.assertRequiresLogin('page.cgi', id='dashboard.html')
+        """Ensure the Dashboard page.cgi template insists on a logged in
+        account.
+        """
+        self.assertRequiresLogin(URL)
 
+    def testRpcRequiresLogin(self):
+        """Ensure all the Dashboard web service methods require a logged in
+        account.
+        """
+        methods = ['delete_overlay', 'get_overlay', 'get_overlays',
+                   'publish_overlay', 'set_overlay', 'clone_overlay',
+                   'get_feed']
+        for method in methods:
+            self.assertFault(FAULT_REQUIRES_LOGIN,
+                getattr(self.rpc_proxy.Dashboard, method))
 
-    '''
-    DB = url('page.cgi?id=dashboard.html')
-    print driver.get(DB)
-    el = driver.find_element_by_class_name('throw_error')
-    help(type(el))
-    assert el.text == 'You must log in before using this part of Bugzilla.'
-    '''
+    def testPageLoads(self):
+        self.login()
+        self.get(URL)
+        assert self.getByCss('title').text == 'Bugzilla Dashboard'
