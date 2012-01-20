@@ -85,6 +85,7 @@ import urlparse
 import xmlrpclib
 
 from selenium import webdriver
+from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.firefox import firefox_binary
 from selenium.webdriver.firefox import firefox_profile
 
@@ -672,10 +673,12 @@ class Suite(object):
 
     def get_error_text(self):
         """Get the text of a Bugzilla error message as rendered by
-        ThrowUserError() etc.
+        ThrowUserError() etc, otherwise None.
         """
-        elem = self.getById('error_msg')
-        return elem.text
+        try:
+            return self.getById('error_msg').text
+        except NoSuchElementException:
+            pass
 
     def get(self, suffix, **kwargs):
         return self.driver.get(self.server.url(suffix, **kwargs))
