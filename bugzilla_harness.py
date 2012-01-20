@@ -60,8 +60,10 @@ run [--instance=<path>] <suite_path> [...]
 
 """
 
+import atexit
 import ConfigParser
 import contextlib
+import datetime
 import hashlib
 import inspect
 import json
@@ -78,11 +80,13 @@ import sys
 import tempfile
 import time
 import urllib
+import urllib2
 import urlparse
+import xmlrpclib
 
 from selenium import webdriver
 from selenium.webdriver.firefox import firefox_binary
-from selenium.webdriver.remote.command import Command
+from selenium.webdriver.firefox import firefox_profile
 
 
 def find_free_port(host=None, desired=0):
@@ -92,7 +96,7 @@ def find_free_port(host=None, desired=0):
     """
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        s.bind((host, desired))
+        s.bind((host or '0.0.0.0', desired))
     except socket.error, e:
         logging.warning('find_free_port: %s', e)
         return
@@ -103,7 +107,7 @@ def find_free_port(host=None, desired=0):
 
 def get_public_ip():
     """Return the 'public' IP address of this machine. That is the address a
-    socket binds to by default when trying to talk to far away networks.
+    socket binds to when talking to remote networks.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     with contextlib.closing(sock):
@@ -252,6 +256,34 @@ def mysql(config, prog, *args):
     return run(args)
 
 
+class TempJanitor:
+    """Selenium developers seem to assume magical tree fairies come and clean
+    up the directories created by tempfile.mkdtemp(), which in fact they don't.
+    So here we monkey-patch mkdtemp() to keep a list of all directories
+    created, so we can come along later and clean up.
+    """
+    def __init__(self):
+        self.paths = []
+        self.real_mkdtemp = tempfile.mkdtemp
+        self.log = logging.getLogger('TempJanitor')
+
+    def _fake_mkdtemp(self, *args, **kwargs):
+        path = self.real_mkdtemp(*args, **kwargs)
+        self.paths.append(path)
+        return path
+
+    def _cleanup(self):
+        if not self.paths:
+            return
+        self.log.debug('Deleting %d temp directories...', len(self.paths))
+        for path in self.paths:
+            shutil.rmtree(path, ignore_errors=True)
+
+    def install(self):
+        tempfile.mkdtemp = self._fake_mkdtemp
+        atexit.register(self._cleanup)
+
+
 class Repository:
     """Manages a cache of remote repositories, primarily to speed up creation
     of local Bugzilla instances.
@@ -304,6 +336,15 @@ class Repository:
 class X11Server:
     """Wraps Xvfb (X virtual framebuffer server) configuration up.
     """
+
+    def __init__(self):
+        """Create an instance.
+        """
+        self.log = logging.getLogger('X11Server')
+        self.display = self._find_free_display()
+        self.display_name = ':%s' % (self.display,)
+        self.proc = None
+
     def _find_free_display(self):
         """Return the first unused X11 display number.
         """
@@ -311,18 +352,14 @@ class X11Server:
             if find_free_port(desired=6000 + display):
                 return display
 
-    def __init__(self):
-        """Create an instance.
-        """
-        self.display = self._find_free_display()
-        self.display_name = ':%s' % (self.display,)
-
     def start(self):
         self.proc = subprocess.Popen(['Xvfb', self.display_name])
         self.log.debug('Xvfb runing on display %s', self.display_name)
 
     def stop(self):
-        self.proc.terminate()
+        if self.proc:
+            self.log.debug('Killing Xvfb PID %d', self.proc.pid)
+            self.proc.terminate()
 
 
 class CgiServer:
@@ -346,7 +383,7 @@ class CgiServer:
         """Create an instance, storing sundry files in `state_dir`, and serving
         `doc_root` via HTTP.
         """
-        self.state_dir = state_dir
+        self.state_dir = os.path.abspath(state_dir)
         self.doc_root = os.path.abspath(doc_root)
         self.public = public
         self.log = logging.getLogger('CgiServer')
@@ -529,7 +566,7 @@ class BugzillaInstance:
         """Create an instance.
         """
         self.config = config
-        self.base_dir = base_dir
+        self.base_dir = os.path.abspath(base_dir)
 
         self._read_state()
 
@@ -573,39 +610,163 @@ class BugzillaInstance:
         edit_file(path, pattern, new_line, 1)
 
 
-class Suite:
+class Suite(object):
     """A test suite.
     """
-    def __init__(self, config, server, bz):
+    # Allow "self.By" and "self.Command" instead of importing a morass of cack
+    # into every test.
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.remote.command import Command
+
+    def __init__(self, config, server, bz, driver):
         self.log = logging.getLogger(self.__class__.__name__)
         self.config = config
         self.server = server
         self.bz = bz
+        self.driver = driver
         self.failures = []
 
-    def assertRequiresLogin(self, suffix, **kwargs):
-        url = self.server.url(suffix, **kwargs)
-        self.driver.get(url)
-        text = self.driver.execute(Command.GET_ELEMENT_TEXT, 'error_msg')
-        from pprint import pprint
-        pprint(text)
-        assert text == 'You must log in before using this part of Bugzilla.'
-        exit()
+    def setUp(self):
+        self.driver.delete_all_cookies()
+
+    def tearDown(self):
+        pass
+
+    def _exec(self, cmd, **kwargs):
+        # For commands, see code.google.com/p/selenium/wiki/JsonWireProtocol
+        # and webdriver/remote/remote_connection.py.
+        return self.driver.execute(getattr(self.Command, cmd), kwargs)['value']
 
     def _get_methods(self):
         return [obj for name, obj in inspect.getmembers(self)
                 if name.startswith('test') and inspect.ismethod(obj)]
 
+    def screenshot(self, name, prefix='SCREENSHOT'):
+        """Save a screenshot to the Bugzilla instance's base_dir.
+        """
+        now = datetime.datetime.now()
+        ymd = now.strftime('%Y-%m-%d-%H%M%S')
+        filename = 'FAIL-%s-%s-%s.png' % (
+            ymd, self.__class__.__name__, name)
+        path = os.path.join(self.bz.base_dir, filename)
+        self.driver.save_screenshot(path)
+
     def _run_one(self, method):
+        self.log.info('Running %s..', method.func_name)
         try:
+            self.setUp()
             method()
+            self.tearDown()
         except Exception, e:
             self.log.exception('Method %s failed.', method.func_name)
+            self.screenshot(method.func_name, prefix='FAIL')
             self.failures.append((method.func_name, e))
 
     def run(self):
         for method in self._get_methods():
             self._run_one(method)
+
+    #
+    # Helpers.
+    #
+
+    def get_error_text(self):
+        """Get the text of a Bugzilla error message as rendered by
+        ThrowUserError() etc.
+        """
+        elem = self.getById('error_msg')
+        return elem.text
+
+    def get(self, suffix, **kwargs):
+        return self.driver.get(self.server.url(suffix, **kwargs))
+
+    def getById(self, elem_id):
+        """Return a WebElement by DOM id= attribute.
+        """
+        return self.driver.find_element(self.By.ID, elem_id)
+
+    def getByCss(self, sel):
+        """Return a WebElement by CSS selector.
+        """
+        return self.driver.find_element(self.By.CSS_SELECTOR, sel)
+
+    def allByCss(self, sel):
+        """Return all WebElements matching a CSS selector.
+        """
+        return self.driver.find_elements(self.By.CSS_SELECTOR, sel)
+
+    def assertEqual(self, a, b):
+        assert a == b, '%r != %r' % (a, b)
+
+    def assertNotEqual(self, a, b):
+        assert a != b, '%r == %r' % (a, b)
+
+    def assertError(self, msg):
+        text = self.get_error_text()
+        assert text, 'Expected error %r, got none.' % (msg,)
+
+    def assertNoError(self):
+        text = self.get_error_text()
+        assert not text, 'Expected no error, got: %r' % (text,)
+
+    def assertRequiresLogin(self, suffix, **kwargs):
+        """Navigate to a URL, then verify Bugzilla insisted on a logged in
+        account.
+        """
+        self.get(suffix, **kwargs)
+        self.assertError('You must log in before using this part of Bugzilla.')
+
+    def assertRaises(self, klass, fn, *args, **kwargs):
+        try:
+            fn(*args, **kwargs)
+        except klass, e:
+            pass
+
+    def assertFault(self, code, fn, *args, **kwargs):
+        try:
+            fn(*args, **kwargs)
+        except xmlrpclib.Fault, e:
+            assert e.faultCode == code, \
+                '%r != %r' % (e.faultCode, code)
+            return
+        assert False, 'Function did not raise a fault.'
+
+    @property
+    def rpc_proxy(self):
+        """Perform an XML-RPC call to the Bugzilla web service.
+        """
+        url = self.server.url('xmlrpc.cgi')
+        return xmlrpclib.ServerProxy(url)
+
+    def logout(self):
+        self.driver.delete_all_cookies()
+
+    def loginAs(self, username, password):
+        self.driver.get(self.server.url(''))
+        self.getById('login_link_top').click()
+
+        elem = self.getById('Bugzilla_login_top')
+        elem.click()
+        elem.send_keys(username)
+
+        elem = self.getById('Bugzilla_password_top')
+        elem.click()
+        elem.send_keys(password)
+
+        self.getById('log_in_top').submit()
+        self.assertNoError()
+
+    def login(self):
+        """Login.
+        """
+        self.loginAs(self.config['bugzilla.user_login'],
+                     self.config['bugzilla.user_password'])
+
+    def loginAsAdmin(self):
+        """Login.
+        """
+        self.loginAs(self.config['bugzilla.admin_login'],
+                     self.config['bugzilla.admin_password'])
 
 
 def parse_config(path):
@@ -658,6 +819,7 @@ def parse_args(args):
         'git repositories)', metavar='offline', action='store_true')
     add('-v', '--verbose', help='Increase log verbosity (debug mode)',
         action="store_true", default=False)
+    add('--instance', help='Instance to use.')
 
     options, args = parser.parse_args(args)
 
@@ -667,6 +829,7 @@ def parse_args(args):
 
     config['verbose'] = options.verbose
     config['offline'] = options.offline
+    config['instance'] = options.instance
 
     return config, args
 
@@ -694,6 +857,7 @@ def start_instance(config, args):
     server = CgiServer(instance.base_dir, instance.bz_dir,
         public=int(config['lighttpd.public']))
     server.start()
+    instance.set_param('urlbase', server.root_url)
 
 
 def stop_instance(config, args):
@@ -718,9 +882,105 @@ def destroy_instance(config, args):
     instance.destroy()
 
 
+def die(fmt, *args):
+    if args:
+        fmt %= args
+    sys.stderr.write('%s: %s\n' % (sys.argv[0], fmt))
+    raise SystemExit(1)
+
+
+def get_suites(path):
+    # Artificially inject this script as 'bugzilla_harness' module, otherwise a
+    # separate copy will end up getting loaded by the test suite scripts, which
+    # breaks the issubclass() tests before.
+    sys.modules['bugzilla_harness'] = sys.modules['__main__']
+
+    with file(path, 'rb') as fp:
+        compiled = compile(fp.read(), path, 'exec')
+
+    ns = {}
+    eval(compiled, ns, ns)
+    return [v for k, v in ns.iteritems()
+            if inspect.isclass(v) and issubclass(v, Suite)]
+
+
+class TestRunner(object):
+    def __init__(self, config, instance, suites):
+        self.log = logging.getLogger('TestRunner')
+        self.config = config
+        self.instance = instance
+        self.suites = suites
+
+        TempJanitor().install()
+
+        # Use a per-instance TMP because WebDriver is so ill-behaved (it calls
+        # mkdtemp() continually without ever cleaning up, and it writes log
+        # files with fixed names to TMP).
+        self.temp_dir = tempfile.mkdtemp(prefix='TestRunner')
+        # Same deal for firefox.WebDriver: it calls mkdtemp() indiscriminately.
+        self.profile_dir = os.path.join(self.temp_dir, 'profile')
+
+        # Initialized to None in case setup() doesn't complete.
+        self.x11 = None
+        self.server = None
+        self.driver = None
+
+    def setup(self):
+        if os.path.exists(self.temp_dir):
+            shutil.rmtree(self.temp_dir)
+        os.mkdir(self.temp_dir, 0755)
+
+        self.x11 = X11Server()
+        self.x11.start()
+
+        self.server = CgiServer(self.instance.base_dir,
+            self.instance.bz_dir, public=int(self.config['lighttpd.public']))
+        self.server.start()
+        self.instance.set_param('urlbase', self.server.root_url)
+
+        os.environ['DISPLAY'] = self.x11.display_name
+        os.environ['TMP'] = self.temp_dir
+        os.environ.pop('http_proxy', None)
+        os.environ.pop('https_proxy', None)
+
+        self._setup_firefox()
+
+    def _setup_firefox(self):
+        os.mkdir(self.profile_dir, 0755)
+        self.binary = firefox_binary.FirefoxBinary('/usr/local/firefox/firefox-bin')
+        self.profile = firefox_profile.FirefoxProfile(self.profile_dir)
+        self.driver = webdriver.Firefox(firefox_binary=self.binary)
+
+    def stop(self):
+        if self.x11:
+            self.x11.stop()
+        if self.server:
+            self.server.stop()
+        if self.driver:
+            try:
+                self.driver.quit()
+            except urllib2.URLError, e:
+                self.log.debug('Caught dumb exception: %s', e)
+        if os.path.exists(self.temp_dir):
+            shutil.rmtree(self.temp_dir)
+
+    def run(self):
+        for klass in self.suites:
+            suite = klass(self.config, self.server, self.instance, self.driver)
+            suite.run()
+
+
 def run_suite(config, args):
     if not len(args):
         usage('Must specify at least one test suite path.')
+
+    suites = []
+    for path in args:
+        suites.extend(get_suites(path))
+
+    if not suites:
+        die('None of the provided test suites export any Suite '
+            'subclasses.')
 
     if config.get('instance'):
         instance = BugzillaInstance(config,
@@ -729,28 +989,12 @@ def run_suite(config, args):
         builder = InstanceBuilder(config)
         instance = builder.build()
 
-    server = CgiServer(instance.base_dir, instance.bz_dir,
-        public=int(config['lighttpd.public']))
-    server.start()
-    instance.set_param('urlbase', server.root_url)
-
+    runner = TestRunner(config, instance, suites)
     try:
-        x11 = X11Server()
-        x11.start()
-
-        os.environ['DISPLAY'] = x11.display_name
-        os.environ.pop('http_proxy', None)
-        os.environ.pop('https_proxy', None)
-
-        binary = firefox_binary.FirefoxBinary('/usr/local/firefox/firefox-bin')
-        driver = webdriver.Firefox(firefox_binary=binary)
-
-        binary.kill()
-
-        run_tests(config, server, bz)
+        runner.setup()
+        runner.run()
     finally:
-        server.stop()
-
+        runner.stop()
         # If no --instance= given on command line, then the instance we have
         # must be temporary, so destroy it.
         if not config.get('instance'):
