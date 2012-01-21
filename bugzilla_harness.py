@@ -859,7 +859,7 @@ class TestCase(object):
         Bugzilla error message whose text is `msg`.
         """
         text = self.get_error_text()
-        assert text, 'Expected error %r, got none.' % (msg,)
+        assert msg == text, 'Expected error %r, got %r.' % (msg, text)
 
     def assertNoError(self):
         """Fail the test if the currently rendered web page includes a Bugzilla
@@ -1210,7 +1210,7 @@ class BugzillaHarness(object):
             usage('Please specify a mode.')
 
         mode = args.pop(0)
-        func = MODES.get(mode)
+        func = self.MODES.get(mode)
         if not func:
             usage('Invalid mode: %r', mode)
 
