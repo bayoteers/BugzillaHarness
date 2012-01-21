@@ -9,7 +9,7 @@ URL = 'page.cgi?id=dashboard.html'
 FAULT_REQUIRES_LOGIN = 410
 
 
-class DashboardSuite(bugzilla_harness.Suite):
+class DashboardTestCase(bugzilla_harness.TestCase):
     def testRequiresLogin(self):
         """Ensure the Dashboard page.cgi template insists on a logged in
         account.
@@ -25,7 +25,7 @@ class DashboardSuite(bugzilla_harness.Suite):
                    'get_feed']
         for method in methods:
             self.assertFault(FAULT_REQUIRES_LOGIN,
-                getattr(self.rpc_proxy.Dashboard, method))
+                getattr(self.xmlrpc.Dashboard, method))
 
     def testPageLoads(self):
         self.login()

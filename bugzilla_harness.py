@@ -75,8 +75,7 @@ run [--instance=<path>] <suite_path> [...]
         Useful for speeding up repeated runs when debugging a failed test.
 
     <suite_path>
-        Path to a Python script implementing the a suite, e.g.
-        dashboard_tests.py.
+        Path to Python script implementing a suite, e.g. dashboard_tests.py.
 
 """
 
@@ -108,6 +107,50 @@ from selenium import webdriver
 from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.firefox import firefox_binary
 from selenium.webdriver.firefox import firefox_profile
+from selenium.webdriver.remote.command import Command
+
+
+def usage(fmt, *args):
+    sys.stderr.write(__doc__)
+    if args:
+        fmt %= args
+    if fmt:
+        sys.stderr.write('ERROR: %s\n' % (fmt,))
+    raise SystemExit(1)
+
+
+def die(fmt, *args):
+    if args:
+        fmt %= args
+    sys.stderr.write('%s: %s\n' % (sys.argv[0], fmt))
+    raise SystemExit(1)
+
+
+def parse_config(path):
+    """Parse an INI file into a dictionary like:
+    
+        {'section.option': 'value',
+         'section.option2': 'value2'}
+
+    This eases writing tests simply by passing regular dicts as
+    configuration, instead of manually populating a ConfigParser. Returned
+    dict contains a magical 'section_items' key which contains all items
+    for a given section, to allow enumeration.
+    """
+    parser = ConfigParser.RawConfigParser()
+    with open(path) as fp:
+        parser.readfp(fp)
+
+    items = {}
+    dct = {'section_items': items}
+
+    for section in parser.sections():
+        items[section] = parser.items(section)
+        dct.update(('%s.%s' % (section, option), value)
+                   for (option, value) in items[section]
+                   if value)
+
+    return dct
 
 
 def find_free_port(host=None, desired=0):
@@ -230,12 +273,14 @@ def get_bugzilla_version(path):
 
 
 def edit_file(path, pattern, new_line, insert_at=0):
-    """Read a file, passing it as a string to the `editor` function, then
-    replace the file's contents with the return value of the function.
+    """Read a file, replacing any lines that match the regex `pattern` with
+    `new_line`. If no line matches, insert `new_line` at `insert_at` lines from
+    the end of file.
 
     Example:
-        # Make contents of /etc/passwd uppercase.
-        edit_file('/etc/passwd', lambda s: s.upper())
+        # Replace dmw's password entry in /etc/passwd with 'cats!', appending
+        # that line to the EOF if a password entry doesn't exist.
+        edit_file('/etc/passwd', '^dmw.*', 'cats!', insert_at=0)
     """
     match = re.compile(pattern).match
 
@@ -249,23 +294,6 @@ def edit_file(path, pattern, new_line, insert_at=0):
         fp.seek(0)
         fp.truncate(0)
         fp.write(''.join(lines))
-
-
-def make_id(prefix):
-    """Return a 'unique' ID with the given prefix, based on the current system
-    time.
-    """
-    return '%s_%s' % (prefix, int(time.time() * 1000))
-
-
-def get_extensions(config):
-    exts = []
-    for section, items in config['section_items'].iteritems():
-        if section.startswith('extension: '):
-            name = section[11:]
-            dct = dict(items)
-            exts.append((name, dct['url'], dct['branch']))
-    return exts
 
 
 def mysql(config, prog, *args):
@@ -287,16 +315,24 @@ class TempJanitor(object):
     created, so we can come along later and clean up.
     """
     def __init__(self):
+        """Create an instance.
+        """
         self.paths = []
         self.real_mkdtemp = tempfile.mkdtemp
         self.log = logging.getLogger('TempJanitor')
 
     def _fake_mkdtemp(self, *args, **kwargs):
+        """tempfile.mkdtemp() wrapper: call the real mkdtemp() and record its
+        return value.
+        """
         path = self.real_mkdtemp(*args, **kwargs)
         self.paths.append(path)
         return path
 
     def _cleanup(self):
+        """atexit handler: walk the set of paths recorded by _fake_mkdtemp()
+        and recursively delete them.
+        """
         if not self.paths:
             return
         self.log.debug('Deleting %d temp directories...', len(self.paths))
@@ -304,6 +340,8 @@ class TempJanitor(object):
             shutil.rmtree(path, ignore_errors=True)
 
     def install(self):
+        """Install _fake_mkdtemp() and our atexit handler.
+        """
         tempfile.mkdtemp = self._fake_mkdtemp
         atexit.register(self._cleanup)
 
@@ -358,13 +396,12 @@ class Repository(object):
         self.log.debug('Shallow cloning %r branch %r into %r',
             repo, branch, dest_dir)
         run(['git', 'clone', '-q', '-b', branch, '--depth', '1',
-            url, dest_dir])
+             url, dest_dir])
 
 
 class X11Server(object):
     """Wraps Xvfb (X virtual framebuffer server) configuration up.
     """
-
     def __init__(self):
         """Create an instance.
         """
@@ -381,10 +418,14 @@ class X11Server(object):
                 return display
 
     def start(self):
+        """Start the X11 server.
+        """
         self.proc = subprocess.Popen(['Xvfb', self.display_name])
         self.log.debug('Xvfb runing on display %s', self.display_name)
 
     def stop(self):
+        """Stop the X11 server.
+        """
         if self.proc:
             self.log.debug('Killing Xvfb PID %d', self.proc.pid)
             self.proc.terminate()
@@ -460,11 +501,15 @@ class CgiServer(object):
 class InstanceBuilder(object):
     """Manage everything to do with creating a Bugzilla installation.
     """
-    def __init__(self, config, instance_id=None, base_dir=None):
+    def __init__(self, config, base_dir=None):
+        """Create an instance using the configuration dict `config`. If
+        `base_dir` is given, build the new installation in the given directory,
+        otherwise create a temporary directory for it.
+        """
         self.config = config
-        self.instance_id = instance_id or make_id('BugzillaInstance')
         self.base_dir = base_dir or os.path.join(
             tempfile.gettempdir(), self.instance_id)
+        self.instance_id = 'BugzillaInstance_%s' % (int(time.time() * 1000),)
 
         self.repo = Repository(cache_dir='repo_cache',
             refresh_cache=not config['offline'])
@@ -481,6 +526,8 @@ class InstanceBuilder(object):
             os.mkdir(self.base_dir, 0755)
 
     def build(self):
+        """Build the installation.
+        """
         self.repo.clone(self.config['bugzilla.url'],
             self.config['bugzilla.branch'], self.bz_dir)
         self._write_state()
@@ -500,14 +547,32 @@ class InstanceBuilder(object):
         return self.instance
 
     def _write_state(self):
+        """Write a JSON file containing various pieces of state necessary to
+        manage the Bugzilla installation.
+        """
         path = os.path.join(self.base_dir, 'state.json')
+        obj = {
+            'instance_id': self.instance_id
+        }
         with file(path, 'wb') as fp:
-            json.dump({
-                'instance_id': self.instance_id
-            }, fp)
+            json.dump(obj, fp)
+
+    def _get_extensions(self):
+        """Return a list of tuples describing the extensions to install.
+        """
+        exts = []
+        for section, items in self.config['section_items'].iteritems():
+            if section.startswith('extension: '):
+                name = section[11:]
+                dct = dict(items)
+                exts.append((name, dct['url'], dct['branch']))
+        return exts
 
     def _create_extensions(self):
-        for name, repo, branch in get_extensions(self.config):
+        """Install each configured extension by checking it out of revision
+        control.
+        """
+        for name, repo, branch in self._get_extensions():
             path = os.path.join(self.instance.ext_dir, name)
             self.repo.clone(repo, branch, path)
 
@@ -533,6 +598,9 @@ class InstanceBuilder(object):
             '-e', '\\. ' + self._get_snapshot_path())
 
     def _create_bz_lib(self):
+        """Create the bugzilla/lib directory using an architecture-specific
+        cache file, if one exists.
+        """
         filename = 'lib_cache_%s_%s.zip' % (self.instance.version, self.arch)
         path = os.path.join(self.config['bugzilla.lib_cache_dir'], filename)
 
@@ -638,9 +706,9 @@ class BugzillaInstance(object):
         edit_file(path, pattern, new_line, 1)
 
 
-class Suite(object):
-    """Represents a suite of tests to run against a Bugzilla instance. This
-    class has a similar interface to unittest.TestCase:
+class TestCase(object):
+    """Represents a test case to run against a Bugzilla instance. This class
+    has a similar interface to unittest.TestCase:
 
         setUp(): invoked before each test.
         tearDown(): invoked after each *successful* test.
@@ -668,11 +736,8 @@ class Suite(object):
         self.By: convenience alias for selenium.webdriver.common.by.By, to
             avoid having to import this manually.
 
-        self.Command: convenience alias for
-            selenium.webdriver.remote.command.Command.
-
     Example:
-        class IndexPageSuite(bugzilla_harness.Suite):
+        class IndexPageTestCase(bugzilla_harness.TestCase):
             '''Test some features of index.cgi.
             '''
             def testLogin(self):
@@ -683,10 +748,8 @@ class Suite(object):
                 self.get('/')
                 assert self.getByCss('h1').text == self.WELCOME_TEXT
     """
-    # Allow "self.By" and "self.Command" instead of importing a morass of cack
-    # into every test.
+    # Allow "self.By" instead of importing a morass of cack in every suite.
     from selenium.webdriver.common.by import By
-    from selenium.webdriver.remote.command import Command
 
     def __init__(self, config, server, instance, driver):
         """Create an instance, using the configuration dict `config`, CgiServer
@@ -710,9 +773,14 @@ class Suite(object):
         """
 
     def _exec(self, cmd, **kwargs):
+        """Convenience for 'self.driver.execute()', but additionally resolving
+        `cmd` as an attribute of selenium.webdriver.remote.command.Command
+        first, and returning only the 'value' item from execute()'s returned
+        dict.
+        """
         # For commands, see code.google.com/p/selenium/wiki/JsonWireProtocol
         # and webdriver/remote/remote_connection.py.
-        return self.driver.execute(getattr(self.Command, cmd), kwargs)['value']
+        return self.driver.execute(getattr(Command, cmd), kwargs)['value']
 
     def screenshot(self, name, prefix='SCREENSHOT'):
         """Save a screenshot to the Bugzilla instance's base_dir.
@@ -805,7 +873,7 @@ class Suite(object):
         xmlrpclib.Fault with a faultCode == `code`.
 
         Example:
-            self.assertFault(410, self.rpc_proxy.Bugzilla.extensions)
+            self.assertFault(410, self.xmlrpc.Bugzilla.extensions)
         """
         try:
             fn(*args, **kwargs)
@@ -816,7 +884,7 @@ class Suite(object):
         assert False, 'Function did not raise a fault.'
 
     @property
-    def rpc_proxy(self):
+    def xmlrpc(self):
         """An xmlrpclib.ServerProxy instance configured to talk to the Bugzilla
         XML-RPC server.
         """
@@ -863,159 +931,18 @@ class Suite(object):
                      self.config['bugzilla.admin_password'])
 
 
-def parse_config(path):
-    """Parse an INI file into a dictionary like:
-    
-        {'section.option': 'value',
-         'section.option2': 'value2'}
-
-    This eases writing tests simply by passing regular dicts as configuration,
-    instead of manually populating a ConfigParser. Returned dict contains a
-    magical 'section_items' key which contains all items for a given section,
-    to allow enumeration.
-    """
-    parser = ConfigParser.RawConfigParser()
-    with open(path) as fp:
-        parser.readfp(fp)
-
-    items = {}
-    dct = {'section_items': items}
-
-    for section in parser.sections():
-        items[section] = parser.items(section)
-        dct.update(('%s.%s' % (section, option), value)
-                   for (option, value) in items[section]
-                   if value)
-
-    return dct
-
-
-def usage(fmt, *args):
-    sys.stderr.write(__doc__)
-    if args:
-        fmt %= args
-    if fmt:
-        sys.stderr.write('ERROR: %s\n' % (fmt,))
-    raise SystemExit(1)
-
-
-def parse_args(args):
-    """Parse command-line arguments, returning a dict whose keys should match
-    those found in the configuration file.
-    """
-    parser = optparse.OptionParser()
-    add = parser.add_option
-
-    add('-c', '--config', help='Pass an additional config file. Options '
-        'specified in this file will override the defaults', metavar='file',
-        action="append", default=["bugzilla_harness.conf"])
-    add('-o', '--offline', help='Work offline (i.e. don\'t try to refresh '
-        'git repositories)', metavar='offline', action='store_true')
-    add('-v', '--verbose', help='Increase log verbosity (debug mode)',
-        action="store_true", default=False)
-    add('--instance', help='Instance to use.')
-
-    options, args = parser.parse_args(args)
-
-    config = {}
-    for path in options.config:
-        config.update(parse_config(path))
-
-    config['verbose'] = options.verbose
-    config['offline'] = options.offline
-    config['instance'] = options.instance
-
-    return config, args
-
-
-def create_instance(config, args):
-    """'create' mode implementation: create a persistent Bugzilla install at
-    the given path.
-    """
-    if len(args) != 1:
-        usage('Create expects exactly one parameter.')
-    base_dir, = args
-
-    builder = InstanceBuilder(config, base_dir=base_dir)
-    builder.build()
-
-
-def start_instance(config, args):
-    """'start' mode implementation: create a BugzillaInstance for the instance
-    passed on the command line, then a CgiServer, call the server's start(),
-    then modify the Bugzilla install's 'urlbase' parameter to point at the
-    CgiServer's root URL.
-    """
-    if len(args) != 1:
-        usage('Must specify exactly one instance path.')
-    base_dir, = args
-
-    instance = BugzillaInstance(config, base_dir=base_dir)
-    server = CgiServer(instance.base_dir, instance.bz_dir,
-        public=int(config['lighttpd.public']))
-    server.start()
-    instance.set_param('urlbase', server.root_url)
-
-
-def stop_instance(config, args):
-    """'stop' mode implementation: create a BugzillaInstance for the instance
-    passed on the command line, then a CgiServer, then call the server's stop()
-    method.
-    """
-    if len(args) != 1:
-        usage('Must specify exactly one instance path.')
-    base_dir, = args
-
-    instance = BugzillaInstance(config, base_dir=base_dir)
-    server = CgiServer(instance.base_dir, instance.bz_dir,
-        public=int(config['lighttpd.public']))
-    server.stop()
-
-
-def destroy_instance(config, args):
-    """'destroy' mode implementation: create a BugzillaInstance for the
-    instance passed on the command line, then call its destroy() method.
-    """
-    if len(args) != 1:
-        usage('Must specify exactly one instance path.')
-    base_dir, = args
-
-    instance = BugzillaInstance(config, base_dir=base_dir)
-    instance.destroy()
-
-
-def die(fmt, *args):
-    if args:
-        fmt %= args
-    sys.stderr.write('%s: %s\n' % (sys.argv[0], fmt))
-    raise SystemExit(1)
-
-
-def get_suites(path):
-    # Artificially inject this script as 'bugzilla_harness' module, otherwise a
-    # separate copy will end up getting loaded by the test suite scripts, which
-    # breaks the issubclass() tests before.
-    sys.modules['bugzilla_harness'] = sys.modules['__main__']
-
-    with file(path, 'rb') as fp:
-        compiled = compile(fp.read(), path, 'exec')
-
-    ns = {}
-    eval(compiled, ns, ns)
-    return [v for k, v in ns.iteritems()
-            if inspect.isclass(v) and issubclass(v, Suite)]
-
-
 class TestRunner(object):
-    """Responsible for executing any configured test suites and collating their
+    """Responsible for executing any configured TestCases and collating their
     results. In addition to setting up the environment, launching the web
     browser and so on, also records failures and timing information.
     """
-    def __init__(self, config, instance, suites):
+    def __init__(self, config, instance, cases):
+        """Create an instance.
+        """
         self.log = logging.getLogger('TestRunner')
         self.config = config
         self.instance = instance
-        self.suites = suites
+        self.cases = cases
         self.failures = []
 
         TempJanitor().install()
@@ -1032,7 +959,19 @@ class TestRunner(object):
         self.server = None
         self.driver = None
 
+    def _setup_firefox(self):
+        """Do all required to start the web browser. Currently Firefox is the
+        hard-coded browser used.
+        """
+        os.mkdir(self.profile_dir, 0755)
+        self.binary = firefox_binary.FirefoxBinary(self.conig['Firefox.path'])
+        self.profile = firefox_profile.FirefoxProfile(self.profile_dir)
+        self.driver = webdriver.Firefox(firefox_binary=self.binary)
+
     def setup(self):
+        """Setup the environment, creating a temporary directory, X11 server,
+        CGI server, web browser, and installing various environment variables.
+        """
         if os.path.exists(self.temp_dir):
             shutil.rmtree(self.temp_dir)
         os.mkdir(self.temp_dir, 0755)
@@ -1052,13 +991,10 @@ class TestRunner(object):
 
         self._setup_firefox()
 
-    def _setup_firefox(self):
-        os.mkdir(self.profile_dir, 0755)
-        self.binary = firefox_binary.FirefoxBinary('/usr/local/firefox/firefox-bin')
-        self.profile = firefox_profile.FirefoxProfile(self.profile_dir)
-        self.driver = webdriver.Firefox(firefox_binary=self.binary)
-
     def stop(self):
+        """Destroy the environment, shutting down the X11 server, CGI server,
+        web browser, and finally cleaning up the TestRunner's temp directory.
+        """
         if self.x11:
             self.x11.stop()
         if self.server:
@@ -1071,91 +1007,196 @@ class TestRunner(object):
         if os.path.exists(self.temp_dir):
             shutil.rmtree(self.temp_dir)
 
-    def run_test(self, suite, method):
-        self.log.info('Running %s..', method.func_name)
+    def _run_test(self, case, test):
+        """Run a single TestCase test function, recording any failure that
+        occurs.
+        """
+        self.log.info('Running %s..', test.func_name)
         try:
-            suite.setUp()
-            method()
-            suite.tearDown()
+            case.setUp()
+            test()
+            case.tearDown()
         except Exception, e:
-            self.log.exception('Method %s failed.', method.func_name)
-            suite.screenshot(method.func_name, prefix='FAIL')
-            self.failures.append((method.func_name, e))
+            self.log.exception('Method %s failed.', test.func_name)
+            case.screenshot(test.func_name, prefix='FAIL')
+            self.failures.append((test.func_name, e))
 
-    def _get_methods(self, suite):
-        return [obj for name, obj in inspect.getmembers(suite)
+    def _get_tests(self, case):
+        """Return a list of test functions defined on the given TestCase
+        instance."""
+        return [obj for name, obj in inspect.getmembers(case)
                 if name.startswith('test') and inspect.ismethod(obj)]
 
-    def run_suite(self, suite):
-        for method in self._get_methods(suite):
-            self._run_one(method)
+    def run_case(self, case):
+        """Run all the test functions defined for the given TestCase
+        instance."""
+        for test in self._get_tests(case):
+            self._run_test(test)
 
     def run(self):
-        for klass in self.suites:
-            suite = klass(self.config, self.server, self.instance, self.driver)
-            suite.run()
+        """Run all the test functions from all the configured TestCases.
+        """
+        for klass in self.cases:
+            case = klass(self.config, self.server, self.instance, self.driver)
+            case.run()
 
 
-def run_suite(config, args):
-    """'run' mode implementation: load the Python scripts passed on the command
-    line, create a temporary BugzillaInstance if necessary, then use TestRunner
-    to execute the suites.
+class BugzillaHarness(object):
+    """Command line interface.
     """
-    if not len(args):
-        usage('Must specify at least one test suite path.')
+    def create_instance(self, config, args):
+        """'create' mode implementation: create a persistent Bugzilla install
+        at the given path.
+        """
+        if len(args) != 1:
+            usage('Create expects exactly one parameter.')
+        base_dir, = args
 
-    suites = []
-    for path in args:
-        suites.extend(get_suites(path))
+        builder = InstanceBuilder(config, base_dir=base_dir)
+        builder.build()
 
-    if not suites:
-        die('None of the provided test suites export any Suite '
-            'subclasses.')
+    def start_instance(self, config, args):
+        """'start' mode implementation: create a BugzillaInstance for the
+        instance passed on the command line, then a CgiServer, call the
+        server's start(), then modify the Bugzilla install's 'urlbase'
+        parameter to point at the CgiServer's root URL.
+        """
+        if len(args) != 1:
+            usage('Must specify exactly one instance path.')
+        base_dir, = args
 
-    if config.get('instance'):
-        instance = BugzillaInstance(config,
-            base_dir=config['instance'])
-    else:
-        builder = InstanceBuilder(config)
-        instance = builder.build()
+        instance = BugzillaInstance(config, base_dir=base_dir)
+        server = CgiServer(instance.base_dir, instance.bz_dir,
+            public=int(config['lighttpd.public']))
+        server.start()
+        instance.set_param('urlbase', server.root_url)
 
-    runner = TestRunner(config, instance, suites)
-    try:
-        runner.setup()
-        runner.run()
-    finally:
-        runner.stop()
-        # If no --instance= given on command line, then the instance we have
-        # must be temporary, so destroy it.
-        if not config.get('instance'):
-            instance.destroy()
+    def stop_instance(self, config, args):
+        """'stop' mode implementation: create a BugzillaInstance for the
+        instance passed on the command line, then a CgiServer, then call the
+        server's stop() method.
+        """
+        if len(args) != 1:
+            usage('Must specify exactly one instance path.')
+        base_dir, = args
 
+        instance = BugzillaInstance(config, base_dir=base_dir)
+        server = CgiServer(instance.base_dir, instance.bz_dir,
+            public=int(config['lighttpd.public']))
+        server.stop()
 
-MODES = {
-    'create': create_instance,
-    'start': start_instance,
-    'stop': stop_instance,
-    'run': run_suite,
-    'destroy': destroy_instance
-}
+    def destroy_instance(self, config, args):
+        """'destroy' mode implementation: create a BugzillaInstance for the
+        instance passed on the command line, then call its destroy() method.
+        """
+        if len(args) != 1:
+            usage('Must specify exactly one instance path.')
+        base_dir, = args
 
-def main():
-    """Main program implementation. Parse the command line and configuration
-    file, set up logging, then run one of the mode functions.
-    """
-    config, args = parse_args(sys.argv[1:])
-    level = logging.DEBUG if config['verbose'] else logging.INFO
-    logging.basicConfig(level=level)
+        instance = BugzillaInstance(config, base_dir=base_dir)
+        instance.destroy()
 
-    if not args:
-        usage('Please specify a mode.')
+    def get_cases(self, path):
+        # Artificially inject this script as 'bugzilla_harness' module,
+        # otherwise a separate copy will end up getting loaded by the test
+        # suite scripts, which breaks the issubclass() tests below.
+        sys.modules['bugzilla_harness'] = sys.modules['__main__']
 
-    mode = args.pop(0)
-    func = MODES.get(mode)
-    if not func:
-        usage('Invalid mode: %r', mode)
+        with file(path, 'rb') as fp:
+            compiled = compile(fp.read(), path, 'exec')
 
-    func(config, args)
+        ns = {}
+        eval(compiled, ns, ns)
+        return [v for k, v in ns.iteritems()
+                if inspect.isclass(v) and issubclass(v, TestCase)]
+
+    def run_suites(self, config, args):
+        """'run' mode implementation: load the Python scripts passed on the
+        command line, create a temporary BugzillaInstance if necessary, then
+        use TestRunner to execute the TestCase classes in those scripts.
+        """
+        if not len(args):
+            usage('Must specify at least one test suite path.')
+
+        cases = []
+        for path in args:
+            cases.extend(self.get_cases(path))
+
+        if not cases:
+            die('None of the test suites export any TestCase classes.')
+
+        if config.get('instance'):
+            instance = BugzillaInstance(config,
+                base_dir=config['instance'])
+        else:
+            builder = InstanceBuilder(config)
+            instance = builder.build()
+
+        runner = TestRunner(config, instance, cases)
+        try:
+            runner.setup()
+            runner.run()
+        finally:
+            runner.stop()
+            # If no --instance= given on command line, then the instance we have
+            # must be temporary, so destroy it.
+            if not config.get('instance'):
+                instance.destroy()
+
+    def parse_args(self, args):
+        """Parse command-line arguments, returning a dict whose keys should
+        match those found in the configuration file.
+        """
+        parser = optparse.OptionParser()
+        add = parser.add_option
+
+        add('-c', '--config', help='Pass an additional config file. Options '
+            'specified in this file will override the defaults', metavar='file',
+            action="append", default=["bugzilla_harness.conf"])
+        add('-o', '--offline', help='Work offline (i.e. don\'t try to refresh '
+            'git repositories)', metavar='offline', action='store_true')
+        add('-v', '--verbose', help='Increase log verbosity (debug mode)',
+            action="store_true", default=False)
+        add('--instance', help='Instance to use.')
+
+        options, args = parser.parse_args(args)
+
+        config = {}
+        for path in options.config:
+            config.update(parse_config(path))
+
+        config['verbose'] = options.verbose
+        config['offline'] = options.offline
+        config['instance'] = options.instance
+
+        return config, args
+
+    MODES = {
+        'create': create_instance,
+        'start': start_instance,
+        'stop': stop_instance,
+        'run': run_suites,
+        'destroy': destroy_instance
+    }
+
+    def main(self):
+        """Program entry point; parse the command line and configuration file,
+        set up logging, then run one of the mode functions.
+        """
+        config, args = self.parse_args(sys.argv[1:])
+        level = logging.DEBUG if config['verbose'] else logging.INFO
+        logging.basicConfig(level=level)
+
+        if not args:
+            usage('Please specify a mode.')
+
+        mode = args.pop(0)
+        func = MODES.get(mode)
+        if not func:
+            usage('Invalid mode: %r', mode)
+
+        func(self, config, args)
+
 
 if __name__ == '__main__':
-    main()
+    BugzillaHarness().main()
