@@ -111,6 +111,9 @@ from selenium.webdriver.remote.command import Command
 
 
 def usage(fmt, *args):
+    """Print the program usage message and exit. If `fmt` is present, use
+    (fmt % args) to print an error message.
+    """
     sys.stderr.write(__doc__)
     if args:
         fmt %= args
@@ -120,6 +123,8 @@ def usage(fmt, *args):
 
 
 def die(fmt, *args):
+    """Print an error message and exit.
+    """
     if args:
         fmt %= args
     sys.stderr.write('%s: %s\n' % (sys.argv[0], fmt))
@@ -491,11 +496,19 @@ class CgiServer(object):
         self.log.debug('Killing httpd PID %d', pid)
         os.kill(pid, signal.SIGTERM)
 
-    def url(self, suffix, **kwargs):
-        url = urlparse.urljoin(self.root_url, suffix)
+    def url(self, url, **kwargs):
+        """Make an absolute URL from a relative URL and a list of query string
+        parameters. The URL is absolute to the CgiServer's root URL.
+
+        Example:
+            self.url('/') => 'http://127.0.0.1:1234/'
+            self.url('page.cgi') => 'http://127.0.0.1:1234/page.cgi'
+            self.url('page.cgi', a=1) => 'http://127.0.0.1:1234/page.cgi?a=1'
+        """
+        abs = urlparse.urljoin(self.root_url, url)
         if kwargs:
-            url += '?' + urllib.urlencode(kwargs)
-        return url
+            abs += '?' + urllib.urlencode(kwargs)
+        return abs
 
 
 class InstanceBuilder(object):
@@ -677,6 +690,9 @@ class BugzillaInstance(object):
         self.version = get_bugzilla_version(self.bz_dir)
 
     def _read_state(self):
+        """Read the Bugzilla instance's instance_id from the JSON state file.
+        This ID is used in various places, e.g. MySQL database name.
+        """
         path = os.path.join(self.base_dir, 'state.json')
         with file(path, 'rb') as fp:
             state = json.load(fp)
@@ -1097,6 +1113,9 @@ class BugzillaHarness(object):
         instance.destroy()
 
     def get_cases(self, path):
+        """Compile the Python script found at `path`, execute it in a dict,
+        then return any TestCase subclasses found in the dict.
+        """
         # Artificially inject this script as 'bugzilla_harness' module,
         # otherwise a separate copy will end up getting loaded by the test
         # suite scripts, which breaks the issubclass() tests below.
