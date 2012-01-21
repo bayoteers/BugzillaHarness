@@ -1,10 +1,12 @@
-# bugzilla_harness
+================
+bugzilla_harness
+================
 
-bugzilla_harness is a tool for running a suite of
-[Selenium](http://www.seleniumhq.com/) tests using Firefox, against a set of
-Bugzilla extensions and a Bugzilla instance configured for MySQL. The Bugzilla
-code, along with extension code, are expected to be stored in Git repositories.
-The harness creates a totally fresh installation for each test invocation, to
+bugzilla_harness is a tool for running a suite of `Selenium
+<http://www.seleniumhq.com/>`_ tests using Firefox, against a set of Bugzilla
+extensions and a Bugzilla instance configured for MySQL. The Bugzilla code,
+along with extension code, are expected to be stored in Git repositories. The
+harness creates a totally fresh installation for each test invocation, to
 ensure repeatability of test results.
 
 A web server is needed to host the CGIs; bugzilla_harness uses lighttpd for
@@ -13,25 +15,26 @@ Unfortunately Apache *insists* on setuid() calls, even when configured to run
 under the current UID.
 
 
-## Requirements
+Requirements
+------------
 
 The following software needs to be installed and available on the system
 path (depending on operating system).
 
- * **lighttpd**
+* **lighttpd**
 
    Required to host the Bugzilla CGIs.
 
        apt-get install lighttpd ; rm /etc/rc2.d/*light* # lighttpd
 
- * **Xvfb**
+* **Xvfb**
 
    On Linux, required in order to execute Firefox without a real X11
    server.
 
         apt-get install xvfb # Xvfb
 
- * **MySQL**
+* **MySQL**
 
    Required in order to host the Bugzilla MySQL database. Any MySQLd will
    do, as long as you have an account that can create new databases.
@@ -39,24 +42,25 @@ path (depending on operating system).
         apt-get install mysql-server # Needs a MySQLd somewhere
         apt-get install mysql-client # mysqladmin, mysql
 
- * **Info-Zip**
+* **Info-Zip**
 
    Required for unpacking cached library snapshots.
 
         apt-get install unzip
 
-  * **Selenium**
+* **Selenium**
 
     The selenium.webdriver Python package is required.
 
         easy_install selenium
 
-  * **Python >= 2.6**
+* **Python >= 2.6**
 
     bugzilla_harness is written in Python.
 
 
-## Synopsis
+Synopsis
+--------
 
 The general plan is to have everything required by a test run to live under
 configuration control, and to collect any logs (including screenshots) during
@@ -66,19 +70,22 @@ the failed test.
 Runs should execute automatically as part of a CI system, however the tool
 
 
-## Writing Tests
+Writing Tests
+-------------
 
 Suites are written just like you'd write a unittest.TestCase, the API is almost
 identical. Various convenience methods are provided, refer to "pydoc
 bugzilla_harness.Suite" for full documentation.
 
 
-## Running Tests
+Running Tests
+-------------
 
 Here are some example approaches to running the harness.
 
 
-### Running against the latest version directly from the command line.
+Running against the latest version directly from the command line.
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 This is useful for debugging a failing test, or while writing tests. First of
 all, use the "create" option to create a persistent Bugzilla installation. This
@@ -99,7 +106,8 @@ done, use "destroy" to destroy the Bugzilla installation.
     $ ./bugzilla_harnesss.py destroy my_bz
 
 
-### Running against a specific extension version, in isolation, from CI.
+Running against a specific extension version, in isolation, from CI.
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 This is useful for testing an extension at each revision from a continuous
 integration system. In this case, a shell script will probably wrap
@@ -115,7 +123,8 @@ bugzilla_harness.py, e.g.:
       --extension=Dashboard:$REV
 
 
-### Running against a specific extension version, from CI.
+Running against a specific extension version, from CI.
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 This is designed to test a specific version, but running with all other
 extension modules configured. This is useful to discover template and database
@@ -128,4 +137,3 @@ extensions are checked out at their HEAD revision, except the one under test.
 
     ./bugzilla_harness.py run \
       --extension=Dashboard:$REV
-
