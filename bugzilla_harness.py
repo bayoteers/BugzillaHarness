@@ -539,9 +539,9 @@ class InstanceBuilder(object):
         otherwise create a temporary directory for it.
         """
         self.config = config
+        self.instance_id = 'BugzillaInstance_%s' % (int(time.time() * 1000),)
         self.base_dir = base_dir or os.path.join(
             tempfile.gettempdir(), self.instance_id)
-        self.instance_id = 'BugzillaInstance_%s' % (int(time.time() * 1000),)
 
         self.repo = Repository(cache_dir='repo_cache',
             refresh_cache=not config['offline'])
