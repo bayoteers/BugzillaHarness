@@ -246,6 +246,25 @@ def get_elf_arch(path):
     return machs.get(mach)
 
 
+def get_perl_arch(path):
+    """Given the path to a perl interpreter, figure out its architecture
+    (32-bit, 64-bit), and return a string that uniquely identifies the type of
+    shared objects its requires.
+
+    On Linux this will be "Linux-i386" or "Linux-amd64"; on OS X this will be
+    "Darwin-i386" or "Darwin-x86_64".
+    """
+    uname = os.uname()
+    platform = uname[0]
+
+    if platform == 'Darwin':
+        arch = uname[-1]
+    else: # Linux
+        arch = get_elf_arch(path)
+
+    return '%s-%s' % (platform, arch)
+
+
 def run(args, return_code=0, cwd=None):
     """Run a command specified as an argv array `args`, logging stdout/stderr
     and throwing an exception if its return code doesn't match `return_code`.
@@ -529,7 +548,6 @@ class InstanceBuilder(object):
         self.bz_dir = os.path.join(self.base_dir, 'bugzilla')
 
         self.perl_path = search_path('perl')
-        self.arch = get_elf_arch(self.perl_path)
 
         self.log = logging.getLogger('InstanceBuilder')
         self.log.debug('Base directory: %r; ID: %r',
@@ -614,7 +632,8 @@ class InstanceBuilder(object):
         """Create the bugzilla/lib directory using an architecture-specific
         cache file, if one exists.
         """
-        filename = 'lib_cache_%s_%s.zip' % (self.instance.version, self.arch)
+        perl_arch = get_perl_arch(self.perl_path)
+        filename = 'lib_cache_%s_%s.zip' % (self.instance.version, perl_arch)
         path = os.path.join(self.config['bugzilla.lib_cache_dir'], filename)
 
         if not os.path.exists(path):
@@ -626,19 +645,35 @@ class InstanceBuilder(object):
         self.log.debug('Extracting %r to %r', path, dest_dir)
         run(['unzip', path, '-d', dest_dir])
 
+    # List of perl packages for which installation failure is OK:
+    INSTALL_FAILED_OK = ['GD']
+
+    def _yield_failed_packages(self, stdout, stderr):
+        """Parse install-module.pl output to figure out which packages failed
+        to install.
+        """
+        pkg = None
+        for line in (stdout + '\n' + stderr).splitlines():
+            bits = line.split()
+            if bits and bits[0] == 'Installing':
+                pkg = bits[1]
+            elif pkg and 'NOT OK' in line and \
+                    pkg not in self.INSTALL_FAILED_OK:
+                yield pkg
+
     def _install_modules(self):
         """Install any modules missing from the lib directory necessary for
         Bugzilla (and any installed extensions) to function.
         """
+        self.log.debug('Running install-module.pl...')
         stdout, stderr = run([self.perl_path, 'install-module.pl', '--all'],
             cwd=self.bz_dir)
 
-        evil_strings = ['NOT OK']
-        for s in evil_strings:
-            if s in stdout or s in stderr:
-                self.log.error('install_modules: evil string %r found in '
-                    'stdout/stderr of install-module.pl')
-                raise Exception('install-module.pl failed.')
+        failed = list(self._yield_failed_packages(stdout, stderr))
+        if failed:
+            self.log.error('required packages %r failed to install', failed)
+            self.log.error('stdout: %s\nstderr: %s', stdout, stderr)
+            raise Exception('install-module.pl failed.')
 
     def _run_checksetup(self):
         """Run checksetup.pl, testing to see if the 'localconfig' settings file
