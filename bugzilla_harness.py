@@ -152,8 +152,7 @@ def parse_config(path):
     for section in parser.sections():
         items[section] = parser.items(section)
         dct.update(('%s.%s' % (section, option), value)
-                   for (option, value) in items[section]
-                   if value)
+                   for (option, value) in items[section])
 
     return dct
 
@@ -857,13 +856,13 @@ class TestCase(object):
         except selenium.common.exceptions.NoSuchElementException:
             pass
 
-    def get(self, path, **kwargs):
+    def get(self, url, **kwargs):
         """Navigate the browser to a URL belonging to the Bugzilla
         instance. `path` refers to the script or file to load that lives under
         BugzillaInstance.base_dir. `kwargs` are appended as GET query
         parameters.
         """
-        return self.driver.get(self.server.url(suffix, **kwargs))
+        return self.driver.get(self.server.url(url, **kwargs))
 
     def getById(self, elem_id):
         """Return a WebElement by DOM id= attribute.
@@ -1016,12 +1015,17 @@ class TestRunner(object):
         hard-coded browser used.
         """
         os.mkdir(self.profile_dir, 0755)
+
+        path = self.config.get('Firefox.path', '').strip() or None
+
         # from wtf.omfg.hierarchies.is.bettah import stupidity
-        self.binary = (selenium.webdriver.firefox.firefox_binary
-            .FirefoxBinary(self.config['Firefox.path']))
         self.profile = (selenium.webdriver.firefox.firefox_profile
             .FirefoxProfile(self.profile_dir))
-        self.driver = selenium.webdriver.Firefox(firefox_binary=self.binary)
+        binary = None
+        if self.config.get('Firefox.path', '').strip():
+            binary = (selenium.webdriver.firefox.firefox_binary
+                .FirefoxBinary(self.config['Firefox.path']))
+        self.driver = selenium.webdriver.Firefox(firefox_binary=binary)
 
     def setup(self):
         """Setup the environment, creating a temporary directory, X11 server,
@@ -1086,14 +1090,14 @@ class TestRunner(object):
         """Run all the test functions defined for the given TestCase
         instance."""
         for test in self._get_tests(case):
-            self._run_test(test)
+            self._run_test(case, test)
 
     def run(self):
         """Run all the test functions from all the configured TestCases.
         """
         for klass in self.cases:
             case = klass(self.config, self.server, self.instance, self.driver)
-            case.run()
+            self.run_case(case)
 
 
 class BugzillaHarness(object):
@@ -1210,7 +1214,7 @@ class BugzillaHarness(object):
 
         add('-c', '--config', help='Pass an additional config file. Options '
             'specified in this file will override the defaults', metavar='file',
-            action="append", default=["conf/bugzilla_harness.conf"])
+            action="append", default=[])
         add('-o', '--offline', help='Work offline (i.e. don\'t try to refresh '
             'git repositories)', metavar='offline', action='store_true')
         add('-v', '--verbose', help='Increase log verbosity (debug mode)',
@@ -1218,6 +1222,9 @@ class BugzillaHarness(object):
         add('--instance', help='Instance to use.')
 
         options, args = parser.parse_args(args)
+
+        if not options.config:
+            options.config.append('conf/bugzilla_harness.conf')
 
         config = {}
         for path in options.config:
