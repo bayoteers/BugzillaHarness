@@ -1210,7 +1210,7 @@ class BugzillaHarness(object):
 
         add('-c', '--config', help='Pass an additional config file. Options '
             'specified in this file will override the defaults', metavar='file',
-            action="append", default=["bugzilla_harness.conf"])
+            action="append", default=["conf/bugzilla_harness.conf"])
         add('-o', '--offline', help='Work offline (i.e. don\'t try to refresh '
             'git repositories)', metavar='offline', action='store_true')
         add('-v', '--verbose', help='Increase log verbosity (debug mode)',
