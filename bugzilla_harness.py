@@ -139,7 +139,7 @@ def die(fmt, *args):
     raise SystemExit(1)
 
 
-def parse_config(path):
+def parse_config(path, dct=None):
     """Parse an INI file into a dictionary like:
     
         {'section.option': 'value',
@@ -154,8 +154,11 @@ def parse_config(path):
     with open(path) as fp:
         parser.readfp(fp)
 
-    items = {}
-    dct = {'section_items': items}
+    if dct is None:
+        items = {}
+        dct = {'section_items': items}
+    else:
+        items = dct.setdefault('section_items', {})
 
     for section in parser.sections():
         items[section] = parser.items(section)
@@ -1239,7 +1242,7 @@ class BugzillaHarness(object):
 
         config = {}
         for path in options.config:
-            config.update(parse_config(path))
+            parse_config(path, config)
 
         config['verbose'] = options.verbose
         config['offline'] = options.offline
