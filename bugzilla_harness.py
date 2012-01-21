@@ -103,11 +103,11 @@ import urllib2
 import urlparse
 import xmlrpclib
 
-from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException
-from selenium.webdriver.firefox import firefox_binary
-from selenium.webdriver.firefox import firefox_profile
-from selenium.webdriver.remote.command import Command
+import selenium.common.exceptions
+import selenium.webdriver
+import selenium.webdriver.firefox.firefox_binary
+import selenium.webdriver.firefox.firefox_profile
+import selenium.webdriver.remote.command
 
 
 def usage(fmt, *args):
@@ -796,7 +796,8 @@ class TestCase(object):
         """
         # For commands, see code.google.com/p/selenium/wiki/JsonWireProtocol
         # and webdriver/remote/remote_connection.py.
-        return self.driver.execute(getattr(Command, cmd), kwargs)['value']
+        val = getattr(selenium.webdriver.remote.command.Command, cmd)
+        return self.driver.execute(val, kwargs)['value']
 
     def screenshot(self, name, prefix='SCREENSHOT'):
         """Save a screenshot to the Bugzilla instance's base_dir.
@@ -818,7 +819,7 @@ class TestCase(object):
         """
         try:
             return self.getById('error_msg').text
-        except NoSuchElementException:
+        except selenium.common.exceptions.NoSuchElementException:
             pass
 
     def get(self, path, **kwargs):
@@ -980,9 +981,12 @@ class TestRunner(object):
         hard-coded browser used.
         """
         os.mkdir(self.profile_dir, 0755)
-        self.binary = firefox_binary.FirefoxBinary(self.conig['Firefox.path'])
-        self.profile = firefox_profile.FirefoxProfile(self.profile_dir)
-        self.driver = webdriver.Firefox(firefox_binary=self.binary)
+        # from wtf.omfg.hierarchies.is.bettah import stupidity
+        self.binary = (selenium.webdriver.firefox.firefox_binary
+            .FirefoxBinary(self.config['Firefox.path']))
+        self.profile = (selenium.webdriver.firefox.firefox_profile
+            .FirefoxProfile(self.profile_dir))
+        self.driver = selenium.webdriver.Firefox(firefox_binary=self.binary)
 
     def setup(self):
         """Setup the environment, creating a temporary directory, X11 server,
