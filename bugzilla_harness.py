@@ -110,6 +110,14 @@ import selenium.webdriver.firefox.firefox_profile
 import selenium.webdriver.remote.command
 
 
+def ensure_exists(path):
+    """Ensure a directory exists, logging a message if it didn't.
+    """
+    if not os.path.exists(path):
+        logging.debug('Creating %r...', path)
+        os.makedirs(path)
+
+
 def usage(fmt, *args):
     """Print the program usage message and exit. If `fmt` is present, use
     (fmt % args) to print an error message.
@@ -381,6 +389,7 @@ class Repository(object):
         self.cache_dir = cache_dir
         self.refresh_cache = refresh_cache
         self.log = logging.getLogger('Repository')
+        ensure_exists(cache_dir)
 
     def _cache_dir(self, url):
         """Given some repository URL, return the path to the directory its
@@ -610,6 +619,7 @@ class InstanceBuilder(object):
         """Return the path of the MySQL database snapshot matching this
         instance's Bugzilla version, or throw an exception if none exists.
         """
+        ensure_exists(self.config['bugzilla.db_snapshot_dir'])
         path = os.path.join(self.config['bugzilla.db_snapshot_dir'],
             'snapshot_%s.sql' % (self.instance.version,))
         if os.path.exists(path):
@@ -631,6 +641,7 @@ class InstanceBuilder(object):
         """Create the bugzilla/lib directory using an architecture-specific
         cache file, if one exists.
         """
+        ensure_exists(self.config['bugzilla.lib_cache_dir'])
         perl_arch = get_perl_arch(self.perl_path)
         filename = 'lib_cache_%s_%s.zip' % (self.instance.version, perl_arch)
         path = os.path.join(self.config['bugzilla.lib_cache_dir'], filename)
