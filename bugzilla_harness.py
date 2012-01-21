@@ -280,7 +280,7 @@ def mysql(config, prog, *args):
     return run(args)
 
 
-class TempJanitor:
+class TempJanitor(object):
     """Selenium developers seem to assume magical tree fairies come and clean
     up the directories created by tempfile.mkdtemp(), which in fact they don't.
     So here we monkey-patch mkdtemp() to keep a list of all directories
@@ -308,7 +308,7 @@ class TempJanitor:
         atexit.register(self._cleanup)
 
 
-class Repository:
+class Repository(object):
     """Manages a cache of remote repositories, primarily to speed up creation
     of local Bugzilla instances.
     """
@@ -361,7 +361,7 @@ class Repository:
             url, dest_dir])
 
 
-class X11Server:
+class X11Server(object):
     """Wraps Xvfb (X virtual framebuffer server) configuration up.
     """
 
@@ -390,7 +390,7 @@ class X11Server:
             self.proc.terminate()
 
 
-class CgiServer:
+class CgiServer(object):
     """Wraps lighttpd up as a simple class that serves CGI scripts from some
     directory.
     """
@@ -457,7 +457,7 @@ class CgiServer:
         return url
 
 
-class InstanceBuilder:
+class InstanceBuilder(object):
     """Manage everything to do with creating a Bugzilla installation.
     """
     def __init__(self, config, instance_id=None, base_dir=None):
@@ -589,7 +589,7 @@ class InstanceBuilder:
             raise Exception('setup_localconfig() failed.')
 
 
-class BugzillaInstance:
+class BugzillaInstance(object):
     def __init__(self, config, base_dir):
         """Create an instance.
         """
@@ -639,60 +639,90 @@ class BugzillaInstance:
 
 
 class Suite(object):
-    """A test suite.
+    """Represents a suite of tests to run against a Bugzilla instance. This
+    class has a similar interface to unittest.TestCase:
+
+        setUp(): invoked before each test.
+        tearDown(): invoked after each *successful* test.
+        test*(): functions beginning with "test" are the actual tests: they are
+            enumerated and executed by the TestRunner running the test.
+        get*(): convenience functions that wrap "self.driver" methods to
+            simplify navigation and fetching DOM elements.
+        assert*(): functions that raise AssertionFailure if their condition is
+            not met.
+
+    Data members:
+        self.config: Configuration dict parsed from the bugzilla_harness.conf
+            files passed on the command line.
+            
+        self.server: CgiServer instance that's hosting the Bugzilla install.
+            Useful for creating URLs (self.server.url(...)).
+
+        self.instance: BugzillaInstance under test. Useful for access to
+            set_config() and set_param() methods.
+
+        self.driver: WebDriver instance controlling the web browser used for
+            the test. Refer to "pydoc selenium.webdriver.Firefox" for the
+            methods available.
+
+        self.By: convenience alias for selenium.webdriver.common.by.By, to
+            avoid having to import this manually.
+
+        self.Command: convenience alias for
+            selenium.webdriver.remote.command.Command.
+
+    Example:
+        class IndexPageSuite(bugzilla_harness.Suite):
+            '''Test some features of index.cgi.
+            '''
+            def testLogin(self):
+                self.loginAs('user@example.com', 'letmein')
+
+            WELCOME_TEXT = 'Welcome to Bugzilla'
+            def testWelcomeText(self):
+                self.get('/')
+                assert self.getByCss('h1').text == self.WELCOME_TEXT
     """
     # Allow "self.By" and "self.Command" instead of importing a morass of cack
     # into every test.
     from selenium.webdriver.common.by import By
     from selenium.webdriver.remote.command import Command
 
-    def __init__(self, config, server, bz, driver):
+    def __init__(self, config, server, instance, driver):
+        """Create an instance, using the configuration dict `config`, CgiServer
+        `server`, BugzillaInstance `instance`, and WebDriver `driver`.
+        """
         self.log = logging.getLogger(self.__class__.__name__)
         self.config = config
         self.server = server
-        self.bz = bz
+        self.instance = instance
         self.driver = driver
-        self.failures = []
 
     def setUp(self):
+        """Called before each test* method; the default implementation simply
+        ensures the Bugzilla instance is logged out.
+        """
         self.driver.delete_all_cookies()
 
     def tearDown(self):
-        pass
+        """Called after each test* method, but only if the test didn't fail;
+        the default implementation does nothing.
+        """
 
     def _exec(self, cmd, **kwargs):
         # For commands, see code.google.com/p/selenium/wiki/JsonWireProtocol
         # and webdriver/remote/remote_connection.py.
         return self.driver.execute(getattr(self.Command, cmd), kwargs)['value']
 
-    def _get_methods(self):
-        return [obj for name, obj in inspect.getmembers(self)
-                if name.startswith('test') and inspect.ismethod(obj)]
-
     def screenshot(self, name, prefix='SCREENSHOT'):
         """Save a screenshot to the Bugzilla instance's base_dir.
         """
         now = datetime.datetime.now()
         ymd = now.strftime('%Y-%m-%d-%H%M%S')
-        filename = 'FAIL-%s-%s-%s.png' % (
-            ymd, self.__class__.__name__, name)
-        path = os.path.join(self.bz.base_dir, filename)
+        filename = '%s-%s-%s-%s.png' % (
+            prefix, ymd, self.__class__.__name__, name)
+        path = os.path.join(self.instance.base_dir, filename)
         self.driver.save_screenshot(path)
-
-    def _run_one(self, method):
-        self.log.info('Running %s..', method.func_name)
-        try:
-            self.setUp()
-            method()
-            self.tearDown()
-        except Exception, e:
-            self.log.exception('Method %s failed.', method.func_name)
-            self.screenshot(method.func_name, prefix='FAIL')
-            self.failures.append((method.func_name, e))
-
-    def run(self):
-        for method in self._get_methods():
-            self._run_one(method)
 
     #
     # Helpers.
@@ -707,7 +737,12 @@ class Suite(object):
         except NoSuchElementException:
             pass
 
-    def get(self, suffix, **kwargs):
+    def get(self, path, **kwargs):
+        """Navigate the browser to a URL belonging to the Bugzilla
+        instance. `path` refers to the script or file to load that lives under
+        BugzillaInstance.base_dir. `kwargs` are appended as GET query
+        parameters.
+        """
         return self.driver.get(self.server.url(suffix, **kwargs))
 
     def getById(self, elem_id):
@@ -726,16 +761,26 @@ class Suite(object):
         return self.driver.find_elements(self.By.CSS_SELECTOR, sel)
 
     def assertEqual(self, a, b):
+        """Fail the test if `a` != `b`.
+        """
         assert a == b, '%r != %r' % (a, b)
 
     def assertNotEqual(self, a, b):
+        """Fail the test if `a` == `b`.
+        """
         assert a != b, '%r == %r' % (a, b)
 
     def assertError(self, msg):
+        """Fail the test if the currently rendered web page does not include a
+        Bugzilla error message whose text is `msg`.
+        """
         text = self.get_error_text()
         assert text, 'Expected error %r, got none.' % (msg,)
 
     def assertNoError(self):
+        """Fail the test if the currently rendered web page includes a Bugzilla
+        error message.
+        """
         text = self.get_error_text()
         assert not text, 'Expected no error, got: %r' % (text,)
 
@@ -747,12 +792,21 @@ class Suite(object):
         self.assertError('You must log in before using this part of Bugzilla.')
 
     def assertRaises(self, klass, fn, *args, **kwargs):
+        """Fail the test if `fn(*args, **kwargs)` does not raise an exception
+        of class `klass`.
+        """
         try:
             fn(*args, **kwargs)
         except klass, e:
             pass
 
     def assertFault(self, code, fn, *args, **kwargs):
+        """Fail the test if `fn(*args, **kwargs)` does not raise an
+        xmlrpclib.Fault with a faultCode == `code`.
+
+        Example:
+            self.assertFault(410, self.rpc_proxy.Bugzilla.extensions)
+        """
         try:
             fn(*args, **kwargs)
         except xmlrpclib.Fault, e:
@@ -763,15 +817,22 @@ class Suite(object):
 
     @property
     def rpc_proxy(self):
-        """Perform an XML-RPC call to the Bugzilla web service.
+        """An xmlrpclib.ServerProxy instance configured to talk to the Bugzilla
+        XML-RPC server.
         """
         url = self.server.url('xmlrpc.cgi')
         return xmlrpclib.ServerProxy(url)
 
     def logout(self):
+        """Destroy any logged in session by deleting any cookies.
+        """
         self.driver.delete_all_cookies()
 
     def loginAs(self, username, password):
+        """Create a Bugzilla session for `username` and `password`, failing the
+        test if login couldn't be completed.
+        """
+        self.logout()
         self.driver.get(self.server.url(''))
         self.getById('login_link_top').click()
 
@@ -787,13 +848,16 @@ class Suite(object):
         self.assertNoError()
 
     def login(self):
-        """Login.
+        """Create a Bugzilla session for a regular user account. The user does
+        not belong to any groups by default, therefore it's useful for testing
+        permission checks, etc.
         """
         self.loginAs(self.config['bugzilla.user_login'],
                      self.config['bugzilla.user_password'])
 
     def loginAsAdmin(self):
-        """Login.
+        """Create a Bugzila session for an administrator user account. The
+        administrator usually belongs to all groups by default.
         """
         self.loginAs(self.config['bugzilla.admin_login'],
                      self.config['bugzilla.admin_password'])
@@ -868,20 +932,23 @@ def create_instance(config, args):
     """'create' mode implementation: create a persistent Bugzilla install at
     the given path.
     """
-    try:
-        base_dir, = args
-    except ValueError:
+    if len(args) != 1:
         usage('Create expects exactly one parameter.')
+    base_dir, = args
 
     builder = InstanceBuilder(config, base_dir=base_dir)
     builder.build()
 
 
 def start_instance(config, args):
-    try:
-        base_dir, = args
-    except ValueError:
+    """'start' mode implementation: create a BugzillaInstance for the instance
+    passed on the command line, then a CgiServer, call the server's start(),
+    then modify the Bugzilla install's 'urlbase' parameter to point at the
+    CgiServer's root URL.
+    """
+    if len(args) != 1:
         usage('Must specify exactly one instance path.')
+    base_dir, = args
 
     instance = BugzillaInstance(config, base_dir=base_dir)
     server = CgiServer(instance.base_dir, instance.bz_dir,
@@ -891,10 +958,13 @@ def start_instance(config, args):
 
 
 def stop_instance(config, args):
-    try:
-        base_dir, = args
-    except ValueError:
+    """'stop' mode implementation: create a BugzillaInstance for the instance
+    passed on the command line, then a CgiServer, then call the server's stop()
+    method.
+    """
+    if len(args) != 1:
         usage('Must specify exactly one instance path.')
+    base_dir, = args
 
     instance = BugzillaInstance(config, base_dir=base_dir)
     server = CgiServer(instance.base_dir, instance.bz_dir,
@@ -903,10 +973,12 @@ def stop_instance(config, args):
 
 
 def destroy_instance(config, args):
-    try:
-        base_dir, = args
-    except ValueError:
+    """'destroy' mode implementation: create a BugzillaInstance for the
+    instance passed on the command line, then call its destroy() method.
+    """
+    if len(args) != 1:
         usage('Must specify exactly one instance path.')
+    base_dir, = args
 
     instance = BugzillaInstance(config, base_dir=base_dir)
     instance.destroy()
@@ -935,11 +1007,16 @@ def get_suites(path):
 
 
 class TestRunner(object):
+    """Responsible for executing any configured test suites and collating their
+    results. In addition to setting up the environment, launching the web
+    browser and so on, also records failures and timing information.
+    """
     def __init__(self, config, instance, suites):
         self.log = logging.getLogger('TestRunner')
         self.config = config
         self.instance = instance
         self.suites = suites
+        self.failures = []
 
         TempJanitor().install()
 
@@ -994,6 +1071,25 @@ class TestRunner(object):
         if os.path.exists(self.temp_dir):
             shutil.rmtree(self.temp_dir)
 
+    def run_test(self, suite, method):
+        self.log.info('Running %s..', method.func_name)
+        try:
+            suite.setUp()
+            method()
+            suite.tearDown()
+        except Exception, e:
+            self.log.exception('Method %s failed.', method.func_name)
+            suite.screenshot(method.func_name, prefix='FAIL')
+            self.failures.append((method.func_name, e))
+
+    def _get_methods(self, suite):
+        return [obj for name, obj in inspect.getmembers(suite)
+                if name.startswith('test') and inspect.ismethod(obj)]
+
+    def run_suite(self, suite):
+        for method in self._get_methods(suite):
+            self._run_one(method)
+
     def run(self):
         for klass in self.suites:
             suite = klass(self.config, self.server, self.instance, self.driver)
@@ -1001,6 +1097,10 @@ class TestRunner(object):
 
 
 def run_suite(config, args):
+    """'run' mode implementation: load the Python scripts passed on the command
+    line, create a temporary BugzillaInstance if necessary, then use TestRunner
+    to execute the suites.
+    """
     if not len(args):
         usage('Must specify at least one test suite path.')
 
@@ -1031,8 +1131,17 @@ def run_suite(config, args):
             instance.destroy()
 
 
+MODES = {
+    'create': create_instance,
+    'start': start_instance,
+    'stop': stop_instance,
+    'run': run_suite,
+    'destroy': destroy_instance
+}
+
 def main():
-    """Main program implementation.
+    """Main program implementation. Parse the command line and configuration
+    file, set up logging, then run one of the mode functions.
     """
     config, args = parse_args(sys.argv[1:])
     level = logging.DEBUG if config['verbose'] else logging.INFO
@@ -1041,20 +1150,12 @@ def main():
     if not args:
         usage('Please specify a mode.')
 
-    MODES = {
-        'create': create_instance,
-        'start': start_instance,
-        'stop': stop_instance,
-        'run': run_suite,
-        'destroy': destroy_instance
-    }
-
     mode = args.pop(0)
-    handler = MODES.get(mode)
-    if not handler:
-        usage('Invalid mode.')
+    func = MODES.get(mode)
+    if not func:
+        usage('Invalid mode: %r', mode)
 
-    handler(config, args)
+    func(config, args)
 
 if __name__ == '__main__':
     main()
