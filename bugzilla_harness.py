@@ -542,7 +542,7 @@ class InstanceBuilder(object):
         self.base_dir = base_dir or os.path.join(
             tempfile.gettempdir(), self.instance_id)
 
-        self.repo = Repository(cache_dir='repo_cache',
+        self.repo = Repository(cache_dir=self.config['repo.cache_dir'],
             refresh_cache=not config['offline'])
         self.bz_dir = os.path.join(self.base_dir, 'bugzilla')
 
@@ -610,8 +610,8 @@ class InstanceBuilder(object):
         """Return the path of the MySQL database snapshot matching this
         instance's Bugzilla version, or throw an exception if none exists.
         """
-        path = os.path.join('db_snapshots', 'snapshot_%s.sql' %\
-            (self.instance.version,))
+        path = os.path.join(self.config['bugzilla.db_snapshot_dir'],
+            'snapshot_%s.sql' % (self.instance.version,))
         if os.path.exists(path):
             return path
         self.log.error('Snapshot for version %r not found at %r',
