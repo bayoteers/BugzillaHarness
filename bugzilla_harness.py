@@ -33,9 +33,8 @@ Options accepted by all modes:
     --config=<path>
         Add the specified configuration file to the list of configuration files
         to be parsed. If no --config is specified, looks for
-        "bugzilla_harness.conf" in the current directory. Subsequently
-        specified configuration files override the values specified in earlier
-        files.
+        "conf/bugzilla_harness.conf". Subsequently specified configuration
+        files override the values in earlier files.
 
     --extension=<name>:<revspec>
         When checking out an extension, use the specified revision rather than
