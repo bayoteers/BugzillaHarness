@@ -342,10 +342,10 @@ def mysql(config, prog, *args):
 
 
 class TempJanitor(object):
-    """Selenium developers seem to assume magical tree fairies come and clean
-    up the directories created by tempfile.mkdtemp(), which in fact they don't.
-    So here we monkey-patch mkdtemp() to keep a list of all directories
-    created, so we can come along later and clean up.
+    """Selenium seems to assume magical tree fairies clean up the directories
+    created by tempfile.mkdtemp(), which in fact they don't. So here we
+    monkey-patch mkdtemp() to keep a list of all directories created, so we can
+    come along later and clean up.
     """
     def __init__(self):
         """Create an instance.
