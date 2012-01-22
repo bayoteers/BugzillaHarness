@@ -1265,13 +1265,12 @@ class BugzillaHarness(object):
         level = logging.DEBUG if config['verbose'] else logging.INFO
         logging.basicConfig(level=level)
 
-        if not args:
+        try:
+            func = self.MODES[args.pop(0)]
+        except IndexError:
             usage('Please specify a mode.')
-
-        mode = args.pop(0)
-        func = self.MODES.get(mode)
-        if not func:
-            usage('Invalid mode: %r', mode)
+        except KeyError, e:
+            usage('Invalid mode: %r', e[0])
 
         func(self, config, args)
 
