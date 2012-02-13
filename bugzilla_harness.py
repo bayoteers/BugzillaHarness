@@ -419,6 +419,8 @@ class Repository(object):
             repo, branch, dest_dir)
         run(['git', 'clone', '-q', '-b', branch, '--depth', '1',
              url, dest_dir])
+        run(['git', 'config', 'remote.origin.url', repo],
+            cwd=dest_dir)
 
 
 class X11Server(object):
