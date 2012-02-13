@@ -329,18 +329,6 @@ def edit_file(path, pattern, new_line, insert_at=0):
         fp.write(''.join(lines))
 
 
-def mysql(config, prog, *args):
-    """Run a MySQL utility program `prog` with authorization parameters
-    added to the command line. Returns (stdout, stderr) tuple.
-    """
-    args = [prog,
-            '-u' + config['mysql.username'],
-            '-p' + config['mysql.password'],
-            '-h' + config['mysql.hostname']] + list(args)
-    logging.debug('Running %r', args)
-    return run(args)
-
-
 class TempJanitor(object):
     """Selenium seems to assume magical tree fairies clean up the directories
     created by tempfile.mkdtemp(), which in fact they don't. So here we
@@ -540,6 +528,117 @@ class CgiServer(object):
         return abs
 
 
+class Database(object):
+    """Base class for creating/populating/destroying databases.
+    """
+    # Filename prefix for database snapshots for this database type.
+    TYPE = None
+
+    def __init__(self, config, name, version):
+        """Create an instance. `name` is the DB name, `version` is the Bugzilla
+        version the database is for.
+        """
+        self.config = config
+        self.name = name
+        self.version = version
+        self.log = logging.getLogger(self.__class__.__name__)
+
+    def _get_snapshot_path(self):
+        """Return the path of the snapshot for the configured Bugzilla version,
+        or throw an exception if none exists.
+        """
+        ensure_exists(self.config['bugzilla.db_snapshot_dir'])
+        path = os.path.join(self.config['bugzilla.db_snapshot_dir'],
+            '%s_snapshot_%s.sql' % (self.TYPE, self.version,))
+        if os.path.exists(path):
+            return path
+        self.log.error('Snapshot for version %r not found at %r',
+            self.version, path)
+        raise Exception('Missing database snapshot (see log).')
+
+    @classmethod
+    def new(cls, type_, *args, **kwargs):
+        """Find the Database subclass with the given TYPE string, and create an
+        instance.
+        """
+        for klass in cls.__subclasses__():
+            if getattr(klass, 'TYPE', None) == type_:
+                return klass(*args, **kwargs)
+        raise ValueError('No database of type %r' % (type_,))
+
+
+class MysqlDatabase(Database):
+    """Manage talking to a MySQL database.
+    """
+    TYPE = 'mysql'
+
+    def _run(self, prog, *args):
+        """Run a MySQL utility program `prog` with authorization parameters
+        added to the command line. Returns (stdout, stderr) tuple.
+        """
+        args = [prog,
+                '-u' + self.config['mysql.username'],
+                '-p' + self.config['mysql.password'],
+                '-h' + self.config['mysql.hostname']] + list(args)
+        self.log.debug('Running %r', args)
+        return run(args)
+
+    def create(self):
+        """Create the database.
+        """
+        self._run('mysqladmin', 'create', self.name)
+        self._run('mysql', self.name, '-e', '\\. ' + self._get_snapshot_path())
+
+    def set_localconfig(self, instance):
+        """Update a BugzillaInstance's localconfig to match this database.
+        """
+        instance.set_config('db_name', self.name)
+        instance.set_config('db_user', self.config['mysql.username'])
+        instance.set_config('db_pass', self.config['mysql.password'])
+
+    def destroy(self):
+        """Destroy the database.
+        """
+        self._run('mysqladmin', '--force', 'drop', self.name)
+
+
+class PostgresqlDatabase(Database):
+    TYPE = 'psql'
+
+    def _run(self, prog, *args):
+        """Run a PostgreSQL utility program `prog` with authorization
+        parameters added to the command line. Returns (stdout, stderr) tuple.
+        """
+        os.environ.update({
+            'PGDATABASE': self.name,
+            'PGUSER': self.config['psql.username'],
+            'PGPASSWORD': self.config['psql.password']
+        })
+
+        args = [prog] + list(args)
+        self.log.debug('Running %r', args)
+        run(args)
+
+    def create(self):
+        """Create the database.
+        """
+        self._run('createdb', self.name)
+        self._run('psql', '-f', self._get_snapshot_path())
+
+    def set_localconfig(self, instance):
+        """Update a BugzillaInstance's localconfig to match this database.
+        """
+        instance.set_config('db_name', self.name)
+        instance.set_config('db_driver', 'pg')
+        instance.set_config('db_user', self.config['psql.username'])
+        instance.set_config('db_pass', self.config['psql.password'])
+
+    def destroy(self):
+        """Destroy the database.
+        """
+        self._run('dropdb', self.name)
+
+
 class InstanceBuilder(object):
     """Manage everything to do with creating a Bugzilla installation.
     """
@@ -574,8 +673,8 @@ class InstanceBuilder(object):
         self._write_state()
 
         self.instance = BugzillaInstance(self.config, self.base_dir)
+        self.instance.db.create()
 
-        self._create_db()
         self._create_extensions()
         self._create_bz_lib()
         self._install_modules()
@@ -593,6 +692,7 @@ class InstanceBuilder(object):
         """
         path = os.path.join(self.base_dir, 'state.json')
         obj = {
+            'db_type': self.config['bugzilla.db_type'],
             'instance_id': self.instance_id
         }
         with file(path, 'wb') as fp:
@@ -616,28 +716,6 @@ class InstanceBuilder(object):
         for name, repo, branch in self._get_extensions():
             path = os.path.join(self.instance.ext_dir, name)
             self.repo.clone(repo, branch, path)
-
-    def _get_snapshot_path(self):
-        """Return the path of the MySQL database snapshot matching this
-        instance's Bugzilla version, or throw an exception if none exists.
-        """
-        ensure_exists(self.config['bugzilla.db_snapshot_dir'])
-        path = os.path.join(self.config['bugzilla.db_snapshot_dir'],
-            'snapshot_%s.sql' % (self.instance.version,))
-        if os.path.exists(path):
-            return path
-        self.log.error('Snapshot for version %r not found at %r',
-            self.instance.version, path)
-        raise Exception('Missing database snapshot (see log).')
-
-    def _create_db(self):
-        """Create a MySQL database named after this Bugzilla instance, and
-        restore an initial snapshot from the snapshots directory. Fails if no
-        suitable snapshot is found.
-        """
-        mysql(self.config, 'mysqladmin', 'create', self.instance_id)
-        mysql(self.config, 'mysql', self.instance_id,
-            '-e', '\\. ' + self._get_snapshot_path())
 
     def _create_bz_lib(self):
         """Create the bugzilla/lib directory using an architecture-specific
@@ -703,9 +781,7 @@ class InstanceBuilder(object):
         """Update localconfig's DB connection parameters to match the MySQL
         connection specified in the harness configuration.
         """
-        self.instance.set_config('db_name', self.instance_id)
-        self.instance.set_config('db_user', self.config['mysql.username'])
-        self.instance.set_config('db_pass', self.config['mysql.password'])
+        self.instance.db.set_localconfig(self.instance)
         self.instance.set_config('webservergroup', '')
         stdout, stderr = self._run_checksetup()
 
@@ -735,6 +811,8 @@ class BugzillaInstance(object):
         self.bz_localconfig = os.path.join(self.bz_dir, 'localconfig')
 
         self.version = get_bugzilla_version(self.bz_dir)
+        self.db = Database.new(self.db_type,
+            config, self.instance_id, self.version)
 
     def _read_state(self):
         """Read the Bugzilla instance's instance_id from the JSON state file.
@@ -744,20 +822,21 @@ class BugzillaInstance(object):
         with file(path, 'rb') as fp:
             state = json.load(fp)
         self.instance_id = state['instance_id']
+        self.db_type = state.get('db_type', 'mysql')
 
     def destroy(self):
         """If this is a temporary instance, destroy all its resources.
         """
         self.log.info('Destroying %r', self.base_dir)
         shutil.rmtree(self.base_dir, ignore_errors=True)
-        mysql(self.config, 'mysqladmin', '--force', 'drop', self.instance_id)
+        self.db.destroy()
 
     def set_config(self, key, value):
         """Add or update the value of a configuration variable in
         <bz_dir/localconfig>.
         """
         pattern = r'^\$' + re.escape(key)
-        new_line = '$%s = %r;' % (key, value)
+        new_line = '$%s = %r;' % (key, str(value))
         edit_file(self.bz_localconfig, pattern, new_line)
 
     def set_param(self, key, value):
@@ -1165,6 +1244,7 @@ class BugzillaHarness(object):
             usage('Must specify exactly one instance path.')
         base_dir, = args
 
+        self.stop_instance(config, args)
         instance = BugzillaInstance(config, base_dir=base_dir)
         instance.destroy()
 

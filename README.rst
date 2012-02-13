@@ -36,11 +36,21 @@ path (depending on operating system).
 
 * **MySQL**
 
-   Required in order to host the Bugzilla MySQL database. Any MySQLd will
-   do, as long as you have an account that can create new databases.
+   Required in order to run bugzilla_harness against a MySQL database. Any
+   MySQLd will do, as long as you have an account that can create new
+   databases.
 
         apt-get install mysql-server # Needs a MySQLd somewhere
         apt-get install mysql-client # mysqladmin, mysql
+
+* **PostreSQL**
+
+    Required in order to run bugzilla_harness against a PostgreSQL database.
+    Any PostgreSQL install will do, as long as you hvae an account that can
+    create new databases.
+
+        apt-get install postgresql # Needs a PostgreSQL install somewhere
+        apt-get install postgresql-client # psql, createdb, dropdb
 
 * **Info-Zip**
 
