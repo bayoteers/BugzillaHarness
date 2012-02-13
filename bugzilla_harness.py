@@ -830,8 +830,8 @@ class BugzillaInstance(object):
         """If this is a temporary instance, destroy all its resources.
         """
         self.log.info('Destroying %r', self.base_dir)
-        shutil.rmtree(self.base_dir, ignore_errors=True)
         self.db.destroy()
+        shutil.rmtree(self.base_dir, ignore_errors=True)
 
     def set_config(self, key, value):
         """Add or update the value of a configuration variable in
