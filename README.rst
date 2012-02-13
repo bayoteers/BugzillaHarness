@@ -108,6 +108,8 @@ Now we can create the snapshot::
     new account for "user@example.com", password "letmein").
     ...
     $ mysqldump bugs > $HOME/src/bugzilla_harness/data/db_snapshots/mysql_snapshot_3.6.2.sql
+    # Or:
+    $ pg_dump -O bugs > $HOME/src/bugzilla_harness/data/db_snapshots/psql_snapshot_3.6.2.sql
     $ cd lib
     $ zip -r $HOME/src/bugzilla_harness/data/lib_cache/lib_cache_3.6.2_Linux-i386.zip .
 
