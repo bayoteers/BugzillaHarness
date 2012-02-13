@@ -77,7 +77,40 @@ configuration control, and to collect any logs (including screenshots) during
 such a run. When a failure occurs, it should be easy to recreate the state of
 the failed test.
 
-Runs should execute automatically as part of a CI system, however the tool
+
+Creating a database snapshot and library cache
+----------------------------------------------
+
+Before running the harness a database snapshot must be created, and optionally
+a library cache too. To create the snapshot, you must install Bugzilla once
+manually, create 2 user accounts, and use mysqldump (or pg_dump) to create the
+snapshot.
+
+First, run the harness with no data to find the DB snapshot filename it wants::
+
+    ./bugzilla_harness.py create foo
+    ...
+    ERROR:MysqlDatabase:Snapshot for version '3.6.2' not found at 'data/db_snapshots/mysql_snapshot_3.6.2.sql'
+
+
+Now we can create the snapshot::
+
+    $ tar zxf ~/bugzilla-3.6.2.tar.bz2
+    ...
+    $ ./checksetup.pl
+    ...
+    Enter e-mail address for initial administrator: admin@example.com
+    Enter password: letmein
+    ...
+    $ perl ./install-module.pl --all
+    ...
+    (Now start a web server pointing at the new Bugzilla instance, and create a
+    new account for "user@example.com", password "letmein").
+    ...
+    $ mysqldump bugs > $HOME/src/bugzilla_harness/data/db_snapshots/mysql_snapshot_3.6.2.sql
+    $ cd lib
+    $ zip -r $HOME/src/bugzilla_harness/data/lib_cache/lib_cache_3.6.2_Linux-i386.zip .
+
 
 
 Writing Tests
